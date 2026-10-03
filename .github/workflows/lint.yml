@@ -1,0 +1,69 @@
+name: lint-and-test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -S warning vm-lab-assistant/scripts/vmctl.sh vm-lab-assistant/scripts/linux/*.sh
+      - name: POSIX syntax (dash)
+        run: for f in vm-lab-assistant/scripts/linux/*.sh; do dash -n "$f"; done
+      - name: python syntax
+        run: python3 -m py_compile vm-lab-assistant/scripts/compare-audit.py
+
+  linux-roundtrip:
+    # Apply strict hardening to the runner against a synthetic sshd config,
+    # roll it back, and require the files to come back byte-identical.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: audit, harden, rollback, compare
+        run: |
+          set -eu
+          cd vm-lab-assistant
+          sudo mkdir -p /etc/ssh/sshd_config.d
+          printf 'Include /etc/ssh/sshd_config.d/*.conf\nX11Forwarding yes\nMatch User guest\n  X11Forwarding yes\n' | sudo tee /etc/ssh/sshd_config >/dev/null
+          echo 'PasswordAuthentication yes' | sudo tee /etc/ssh/sshd_config.d/50-cloud-init.conf >/dev/null
+          sudo cp -a /etc/ssh /tmp/ssh.before
+          sudo cp -a /etc/login.defs /tmp/login.defs.before
+          sudo sh scripts/linux/audit.sh --json /tmp/before.json || true
+          python3 -m json.tool /tmp/before.json >/dev/null
+          sudo sh scripts/linux/harden.sh --dry-run --profile strict
+          # skip controls that would change the runner's network/services
+          sudo sh scripts/linux/harden.sh --profile strict --skip HD-FW-001,HD-KN-001 || true
+          grep -q '^PermitRootLogin no' /etc/ssh/sshd_config.d/00-lab-hardening.conf
+          sudo sh scripts/linux/audit.sh --json /tmp/after.json || true
+          python3 scripts/compare-audit.py /tmp/before.json /tmp/after.json || true
+          J=$(ls -d /var/backups/lab-harden/* | tail -1)
+          sudo sh scripts/linux/harden.sh --rollback "$J"
+          sudo diff -r /tmp/ssh.before /etc/ssh
+          sudo diff /tmp/login.defs.before /etc/login.defs
+          echo "rollback restored originals"
+
+  powershell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: parse
+        shell: pwsh
+        run: |
+          $bad = 0
+          foreach ($f in Get-ChildItem vm-lab-assistant/scripts/windows/*.ps1) {
+            $t = $null; $e = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$t, [ref]$e) | Out-Null
+            foreach ($x in $e) { "{0}:{1} {2}" -f $f.Name, $x.Extent.StartLineNumber, $x.Message; $bad++ }
+          }
+          if ($bad) { exit 1 }
+      - name: PSScriptAnalyzer (errors only)
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          $r = Invoke-ScriptAnalyzer -Path vm-lab-assistant/scripts/windows -Severity Error
+          $r | Format-Table -AutoSize
+          if ($r) { exit 1 }

@@ -8,7 +8,7 @@
     changing anything, so a bad change can be reverted.
 
     REQUIRES ELEVATION. Run via:
-        vmctl.sh run-elevated scripts/Invoke-Hardening.ps1 -Profile Baseline
+        vmctl.sh run-elevated scripts/windows/Invoke-Hardening.ps1 -Profile Baseline
 
 .PARAMETER Profile
     Baseline  - safe, broadly reversible, low breakage risk (default)
@@ -62,13 +62,14 @@ Invoke-Hardening.ps1 requires elevation.
 
 Options:
   1. Run Enable-AgentElevation.ps1 once (elevated, inside the VM), then from
-     the host use:  vmctl.sh run-elevated scripts/Invoke-Hardening.ps1 ...
+     the host use:  vmctl.sh run-elevated scripts/windows/Invoke-Hardening.ps1 ...
   2. Or run this directly from an elevated PowerShell inside the VM.
 "@
     exit 3
 }
 
 $script:Journal = [System.Collections.Generic.List[object]]::new()
+$script:JournalFile = $null
 $script:Applied = 0
 $script:Failed  = 0
 $script:Skipped = 0
@@ -81,6 +82,27 @@ function Add-Journal {
         Id = $Id; Type = $Type; Before = $Before; After = $After
         TimestampUtc = (Get-Date).ToUniversalTime().ToString('s') + 'Z'
     })
+    Save-Journal
+}
+
+# Flush the journal after every change, so a crash, reboot, or host-side
+# timeout part-way through still leaves a usable rollback file.
+function Save-Journal {
+    if (-not $script:JournalFile) {
+        New-Item -ItemType Directory -Force -Path $JournalPath | Out-Null
+        $script:JournalFile = Join-Path $JournalPath ("rollback-{0}.json" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    }
+    ConvertTo-Json -InputObject @($script:Journal) -Depth 8 |
+        Set-Content -LiteralPath $script:JournalFile -Encoding UTF8
+}
+
+# Snapshot the full audit policy so it can be restored with auditpol /restore.
+function Backup-AuditPolicy {
+    New-Item -ItemType Directory -Force -Path $JournalPath | Out-Null
+    $f = Join-Path $JournalPath ("auditpol-{0}.csv" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    & auditpol /backup /file:"$f" | Out-Null
+    if (Test-Path -LiteralPath $f) { return @{ AuditPolBackup = $f } }
+    return @{}
 }
 
 function Test-Selected {
@@ -176,12 +198,29 @@ function Invoke-HardeningAction {
 if ($RollbackFile) {
     if (-not (Test-Path $RollbackFile)) { Write-Error "Rollback file not found: $RollbackFile"; exit 2 }
     Write-Output "Reverting from journal: $RollbackFile"
-    $entries = (Get-Content -LiteralPath $RollbackFile -Raw | ConvertFrom-Json)
+    $entries = @(Get-Content -LiteralPath $RollbackFile -Raw | ConvertFrom-Json)
     # Revert newest-first.
     for ($i = $entries.Count - 1; $i -ge 0; $i--) {
         $e = $entries[$i]
         if ($e.Type -ne 'Registry') {
-            Write-Output "  [skip]  $($e.Id) : type '$($e.Type)' must be reverted manually"
+            $b = $e.Before
+            try {
+                if ($b -and $b.Service -and $b.StartMode) {
+                    # Win32_Service StartMode -> Set-Service StartupType
+                    $st = @{ Auto='Automatic'; Manual='Manual'; Disabled='Disabled' }["$($b.StartMode)"]
+                    if (-not $st) { throw "unmapped StartMode '$($b.StartMode)'" }
+                    Set-Service -Name $b.Service -StartupType $st -ErrorAction Stop
+                    if ("$($b.Status)" -eq 'Running') { Start-Service -Name $b.Service -ErrorAction Stop }
+                    Write-Output "  [rev]   $($e.Id) : $($b.Service) -> $st$(if ("$($b.Status)" -eq 'Running') {', started'})"
+                } elseif ($b -and $b.AuditPolBackup -and (Test-Path -LiteralPath $b.AuditPolBackup)) {
+                    & auditpol /restore /file:"$($b.AuditPolBackup)" | Out-Null
+                    Write-Output "  [rev]   $($e.Id) : audit policy restored from $($b.AuditPolBackup)"
+                } else {
+                    Write-Output "  [skip]  $($e.Id) : type '$($e.Type)' must be reverted manually"
+                }
+            } catch {
+                Write-Output "  [FAIL]  $($e.Id) : $($_.Exception.Message)"
+            }
             continue
         }
         try {
@@ -576,6 +615,7 @@ Set-HardeningReg -Id 'HD-LOG-004' `
 Invoke-HardeningAction -Id 'HD-LOG-005' `
     -Description 'Enable key audit policy subcategories' `
     -Test   { $false } `
+    -CaptureState { Backup-AuditPolicy } `
     -Apply  {
         $subs = @(
             @{ N='Process Creation';              S='enable'; F='disable' }
@@ -668,9 +708,8 @@ Write-Output ("Failed  : {0}" -f $script:Failed)
 Write-Output ("Skipped : {0} (not in profile '{1}', or filtered)" -f $script:Skipped, $Profile)
 
 if ($script:Journal.Count -gt 0) {
-    New-Item -ItemType Directory -Force -Path $JournalPath | Out-Null
-    $jf = Join-Path $JournalPath ("rollback-{0}.json" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
-    $script:Journal | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $jf -Encoding UTF8
+    Save-Journal
+    $jf = $script:JournalFile
     Write-Output ''
     Write-Output "Rollback journal: $jf"
     Write-Output "Revert with: .\Invoke-Hardening.ps1 -RollbackFile `"$jf`""

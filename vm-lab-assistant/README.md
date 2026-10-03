@@ -1,158 +1,416 @@
 # VM Lab Assistant
 
 A portable AI skill plus standalone scripts for controlling, auditing,
-hardening, and patching lab virtual machines — **Windows client, Windows
+hardening, and patching lab virtual machines: **Windows 10/11, Windows
 Server, Active Directory domain controllers, and Linux**.
 
-Every check in this document includes **what it checks, why it matters, the
-manual command to run it yourself, and how to undo it.** You can use this
-purely as a study reference and never run a script at all.
+This README is written as a **manual you can learn from and follow by hand**.
+For every phase it explains:
+
+- **what** is being done and **why** (the attack it stops, the risk it carries),
+- the **scripted** way (one command),
+- the **manual** way (the exact commands or clicks the script would run for
+  you), so you can do it without the scripts or understand what they did,
+- how to **verify** it worked, and
+- how to **undo** it.
+
+You can read it as a study guide and never run a script. You can also use the
+scripts and come back here when you need to know what they did.
 
 ---
 
 ## Contents
 
-- [Scope and design](#scope-and-design)
-- [Install](#install)
-- [Configuration](#configuration)
-- [The workflow](#the-workflow)
-- [`vmctl.sh` command reference](#vmctlsh-command-reference)
-- [**Windows checks (61)**](#windows-checks)
-- [**Active Directory checks (45+)**](#active-directory-checks)
-- [**Linux checks (70+)**](#linux-checks)
+**Part 1 - Understand**
+- [1. What this toolkit does](#1-what-this-toolkit-does)
+- [2. Key concepts you need first](#2-key-concepts-you-need-first)
+- [3. Files in this folder](#3-files-in-this-folder)
+
+**Part 2 - Set up**
+- [4. Prerequisites](#4-prerequisites)
+- [5. Install](#5-install)
+- [6. Configuration (`.vmctl.env`) explained line by line](#6-configuration-vmctlenv-explained-line-by-line)
+- [7. Verify you have control of the guest](#7-verify-you-have-control-of-the-guest)
+
+**Part 3 - The workflow with scripts**
+- [8. The six phases](#8-the-six-phases)
+- [9. Windows client or server, scripted](#9-windows-client-or-server-scripted)
+- [10. Active Directory domain controller, scripted](#10-active-directory-domain-controller-scripted)
+- [11. Linux, scripted](#11-linux-scripted)
+- [12. `vmctl.sh` command reference](#12-vmctlsh-command-reference)
+
+**Part 4 - Doing everything by hand**
+- [13. Manual phase 0: snapshot](#13-manual-phase-0-snapshot)
+- [14. Manual phase 1: hypervisor (VMX) review](#14-manual-phase-1-hypervisor-vmx-review)
+- [15. Manual Windows procedure](#15-manual-windows-procedure)
+- [16. Manual Active Directory procedure](#16-manual-active-directory-procedure)
+- [17. Manual Linux procedure](#17-manual-linux-procedure)
+- [18. Manual verification: comparing before and after](#18-manual-verification-comparing-before-and-after)
+- [19. Manual clean-up](#19-manual-clean-up)
+
+**Part 5 - Reference**
+- [Windows checks (61)](#windows-checks)
+- [Active Directory checks (45+)](#active-directory-checks)
+- [Linux checks (70+)](#linux-checks)
 - [Hardening profiles](#hardening-profiles)
 - [Rollback](#rollback)
-- [Safety](#safety)
+- [Safety rules](#safety-rules)
+- [Troubleshooting quick reference](#troubleshooting-quick-reference)
+- [Glossary](#glossary)
+- [Testing status](#testing-status)
 
 ---
 
-## Scope and design
+# Part 1 - Understand
 
-| Target | Audit | Harden | Patch | Transport |
+## 1. What this toolkit does
+
+| Target | Audit (read-only) | Harden (changes things) | Patch | How the host reaches it |
 |---|---|---|---|---|
-| Windows 10/11 client | `windows/Invoke-HardeningAudit.ps1` | `windows/Invoke-Hardening.ps1` | `windows/Invoke-Patching.ps1` | vmrun guest ops |
-| Windows Server | same + role checks | same | same | vmrun guest ops |
-| AD domain controller | `windows/Invoke-ADAudit.ps1` | `windows/Invoke-ADHardening.ps1` | `windows/Invoke-Patching.ps1` | vmrun guest ops |
-| Linux (any major distro) | `linux/audit.sh` | `linux/harden.sh` | `linux/patch.sh` | SSH |
+| Windows 10/11 client | `windows/Invoke-HardeningAudit.ps1` | `windows/Invoke-Hardening.ps1` | `windows/Invoke-Patching.ps1` | VMware guest operations (`vmrun`) |
+| Windows Server | same, plus server-role checks | same | same | `vmrun` |
+| AD domain controller | `windows/Invoke-ADAudit.ps1` | `windows/Invoke-ADHardening.ps1` | `windows/Invoke-Patching.ps1` | `vmrun` |
+| Linux (Debian/Ubuntu, RHEL/Rocky/Alma/Fedora, SUSE, Alpine, Arch) | `linux/audit.sh` | `linux/harden.sh` | `linux/patch.sh` | SSH |
+| Hypervisor layer (the `.vmx` file) | `vmctl.sh audit-host` | manual VMX edits | - | read on the host |
 
-Design rules this toolkit follows:
+Design rules every script follows:
 
-1. **Audit is always read-only.** It never writes, never changes state.
-2. **Hardening always supports dry-run** and writes a rollback journal.
-3. **Scripts are standalone.** Each runs by hand with no framework, no
-   modules to install, no internet access.
-4. **Degrade, never crash.** A check that cannot run reports `Unknown`,
-   it does not abort the run.
-5. **Exit codes are meaningful:** `0` clean, `1` warnings, `2` failures.
+1. **Audit never changes anything.** It only reads.
+2. **Hardening always has a dry run** (`-WhatIf` on Windows, `--dry-run` on
+   Linux) and writes a **rollback journal** before it changes anything.
+3. **Scripts are standalone.** Each one runs by hand with no framework, no
+   modules to install, and no internet access needed (except patching).
+4. **Degrade, never crash.** A check that cannot run reports `Unknown`
+   instead of aborting the whole run.
+5. **Exit codes mean something:** `0` clean, `1` warnings only, `2` failures
+   present. Scripts can be chained and scored.
 
-### Files
+## 2. Key concepts you need first
+
+Read this section once. Most "why did that fail?" questions are answered here.
+
+### 2.1 Guest, host, and the hypervisor
+
+- The **host** is your real computer (macOS, Linux, or Windows with WSL).
+- The **guest** is the operating system running inside the VM.
+- The **hypervisor** (VMware Fusion or Workstation) runs the guest. Its
+  settings live in a text file called the **`.vmx`**.
+- **VMware Tools** is an agent installed *inside* the guest. It lets the host
+  run programs and copy files in the guest **without any network** via
+  `vmrun`. The Windows path in this toolkit depends on it.
+
+### 2.2 How the host runs commands in the guest
+
+| Guest | Mechanism | What you need |
+|---|---|---|
+| Windows | `vmrun -gu USER -gp PASS runProgramInGuest ...` through VMware Tools | VMware Tools running, a local account and its password |
+| Linux | `ssh` / `scp` | sshd running in the guest, a user, ideally a key, and `sudo` |
+
+`vmctl.sh` wraps both so you don't have to remember the flags. Doing it by
+hand looks like this:
+
+```bash
+# Windows guest: run a command and capture output through a file
+vmrun -T fusion -gu labadmin -gp 'Passw0rd!' runProgramInGuest "$VMX" \
+  C:\\Windows\\System32\\cmd.exe "/c whoami > C:\\Windows\\Temp\\o.txt"
+vmrun -T fusion -gu labadmin -gp 'Passw0rd!' CopyFileFromGuestToHost "$VMX" \
+  'C:\Windows\Temp\o.txt' ./o.txt
+iconv -f UTF-16LE -t UTF-8 o.txt 2>/dev/null || cat o.txt
+
+# Linux guest
+ssh labadmin@192.168.1.50 'id; uname -a'
+```
+
+### 2.3 UAC token filtering: why "Administrator" is not "elevated"
+
+When a member of the Administrators group logs on to Windows, Windows creates
+**two tokens**: a filtered one (standard user rights, Administrators group
+marked *deny-only*) and a full one. Programs get the **filtered** token
+unless you approve a UAC prompt ("Run as administrator").
+
+Programs started through VMware Tools always get the **filtered** token, and
+nobody is there to approve a prompt. So:
+
+- Reading most settings works.
+- Writing to `HKLM`, changing Defender, firewall policy, services, or
+  Windows features fails with **`Access is denied`**, even though the account
+  is in Administrators.
+
+Check it yourself:
+
+```powershell
+whoami /groups | findstr /i "S-1-16-"     # Mandatory Label: Medium = filtered, High = elevated
+([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole('Administrators')
+```
+
+`vmctl.sh whoami` prints `Elevated=False` in this situation.
+
+**The fix used here:** `Enable-AgentElevation.ps1` (run once, by you, in an
+elevated window inside the guest) registers a **scheduled task** that runs as
+`SYSTEM`. The host drops the script path and arguments into
+`C:\Windows\Temp\vmctl\task.cmdline` and starts the task with
+`schtasks /Run`. The task runs elevated, writes `elevated.log` and an exit code
+to `elevated.done`, and the host reads them back. See
+[15.2](#152-elevation) for how to do this by hand and what the security
+trade-off is.
+
+The **built-in** `Administrator` account (RID 500) is the exception: by
+default it is *not* filtered (`FilterAdministratorToken=0`). Control
+`HD-ID-003` turns filtering on for it too, so after Baseline hardening even
+that account needs the elevation task.
+
+### 2.4 Linux privilege: sudo without a terminal
+
+Scripts run over SSH have **no terminal** to type a sudo password into.
+`lrun --sudo` uses `sudo -n` (non-interactive), which fails instead of
+hanging if a password is needed. For a lab, give the admin user a
+passwordless rule **for the duration of the work only**:
+
+```bash
+echo 'labadmin ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/90-lab-temp
+sudo chmod 440 /etc/sudoers.d/90-lab-temp
+sudo visudo -c                     # ALWAYS validate sudoers
+# remove when done:
+sudo rm /etc/sudoers.d/90-lab-temp
+```
+
+Audit check `ID-010` flags this rule while it exists. That's intended.
+
+### 2.5 Profiles: how much to change
+
+| Profile | Risk | Meaning |
+|---|---|---|
+| `Baseline` / `baseline` | Low | Safe defaults most systems tolerate. Broadly reversible. |
+| `Strict` / `strict` | Medium | Can break legacy software: LSASS protection, ASR rules, SMBv1/PSv2 removal, keys-only SSH, TLS 1.0/1.1 off. |
+| `Paranoid` / `paranoid` | High | Removes remote management (WinRM, RDP), umask 077, deny all NTLM in AD. Don't apply to a machine you can reach only over the network. |
+
+Profiles are cumulative: Strict includes everything in Baseline. **Escalate
+one profile at a time and re-audit between them.**
+
+### 2.6 Snapshots vs. rollback journals
+
+- A **snapshot** freezes the whole VM (disk + optionally memory). Reverting
+  undoes everything at once, including things you wanted to keep. It is the
+  safety net.
+- A **rollback journal** records the previous value of every setting the
+  hardening script changed, so you can undo *just those changes*. It is the
+  precise tool.
+
+Use both: snapshot first, then rely on the journal for fine-grained undo,
+and revert the snapshot if something is badly broken.
+
+### 2.7 Control IDs
+
+Every audit check has an ID (`ID-001`, `SSH-004`, `AD-083`...). Every
+hardening control has an ID prefixed `HD-` (Windows/Linux) or `ADH-` (AD). Use
+them to filter:
+
+```bash
+harden.sh --profile strict --only HD-SSH-011,HD-FW-001
+Invoke-Hardening.ps1 -Profile Baseline -Skip HD-SU-004
+```
+
+## 3. Files in this folder
 
 ```
-SKILL.md                             portable skill definition
-README.md                            this file
-.vmctl.env.example                   config template
-scripts/vmctl.sh                     host control wrapper (vmrun + SSH)
+SKILL.md                             skill definition the AI assistant reads
+README.md                            this manual
+.vmctl.env.example                   configuration template (copy to .vmctl.env)
+scripts/vmctl.sh                     host-side control wrapper (vmrun + SSH)
+scripts/compare-audit.py             diff two audit JSON reports (before/after)
 scripts/windows/
+  Enable-AgentElevation.ps1          one-time UAC elevation bootstrap (scheduled task)
   Invoke-HardeningAudit.ps1          61 checks, read-only
-  Invoke-Hardening.ps1               remediation, 3 profiles, rollback
-  Invoke-Patching.ps1                Windows Update + Defender
-  Invoke-ADAudit.ps1                 45+ AD checks, read-only
-  Invoke-ADHardening.ps1             AD remediation, rollback
-  Enable-AgentElevation.ps1          one-time UAC elevation bootstrap
+  Invoke-Hardening.ps1               remediation, 3 profiles, journal + rollback
+  Invoke-Patching.ps1                Windows Update + Defender signatures
+  Invoke-ADAudit.ps1                 45+ Active Directory checks, read-only
+  Invoke-ADHardening.ps1             AD remediation, journal + rollback
 scripts/linux/
-  audit.sh                           70+ CIS-aligned checks, read-only
-  harden.sh                          remediation, 3 profiles, rollback
-  patch.sh                           apt/dnf/yum/zypper/apk/pacman
-reference/checklist.md               phase-by-phase runbook
-reference/troubleshooting.md         verbatim symptoms and fixes
+  audit.sh                           70+ CIS-aligned checks, read-only, POSIX sh
+  harden.sh                          remediation, 3 profiles, journal + rollback
+  patch.sh                           apt / dnf / yum / zypper / apk / pacman
+reference/checklist.md               phase-by-phase runbook with tick boxes
+reference/troubleshooting.md         verbatim error messages and their fixes
 ```
 
 ---
 
-## Install
+# Part 2 - Set up
 
-### Claude Code / opencode
+## 4. Prerequisites
+
+### On the host
+
+| Need | Why | Check |
+|---|---|---|
+| bash 3.2+ (macOS default is fine), `iconv`, `base64`, `od` | `vmctl.sh` | `bash --version` |
+| VMware Fusion or Workstation with `vmrun` | Windows guest control, snapshots | `"/Applications/VMware Fusion.app/Contents/Public/vmrun" list` |
+| OpenSSH client (`ssh`, `scp`) | Linux guest control | `ssh -V` |
+| Python 3 (optional) | `vmctl.sh compare` | `python3 --version` |
+
+### In a Windows guest
+
+| Need | Why | Check (in the guest) |
+|---|---|---|
+| VMware Tools installed and running | all `vmrun` guest operations | `Get-Service VMTools` shows Running |
+| A local admin account with a password | `vmrun -gu/-gp` refuses blank passwords | `net user labadmin` |
+| Windows PowerShell 5.1 | scripts target 5.1 | `$PSVersionTable.PSVersion` |
+| For AD scripts: RSAT AD module | `Import-Module ActiveDirectory` | present by default on a DC |
+
+### In a Linux guest
+
+| Need | Why | Check |
+|---|---|---|
+| sshd running and reachable | transport | `systemctl status ssh` (Debian/Ubuntu) or `sshd` |
+| A user with sudo | hardening and patching need root | `sudo -n true && echo ok` |
+| An SSH key (strongly recommended) | `strict` turns password login off | `ls ~/.ssh/authorized_keys` |
+
+## 5. Install
+
+### As an AI skill (Claude Code, opencode)
 
 ```bash
 mkdir -p ~/.claude/skills
 cp -r vm-lab-assistant ~/.claude/skills/vm-lab-assistant
 ```
 
-opencode also auto-loads `~/.agents/skills/` and `.opencode/skills/`.
+opencode also loads `~/.agents/skills/` and `.opencode/skills/`.
 
-### Any other assistant (ChatGPT, Gemini, Cursor)
+### For any other assistant (ChatGPT, Gemini, Cursor)
 
-Point it at `SKILL.md`, or paste that file into the system prompt. Keep
-`scripts/` and `reference/` beside it.
+Give it `SKILL.md` (or paste it into the system prompt) and keep `scripts/`
+and `reference/` next to it.
 
 ### Standalone (no AI)
 
-Nothing to install. Copy `scripts/` to the host and run them.
+Nothing to install. Copy the folder to the host and make the scripts executable:
 
----
+```bash
+chmod +x scripts/vmctl.sh scripts/compare-audit.py scripts/linux/*.sh
+```
 
-## Configuration
+To use a guest script without the host wrapper, copy it into the guest
+(shared folder, `scp`, USB ISO, or paste) and run it there; see Part 4.
+
+## 6. Configuration (`.vmctl.env`) explained line by line
 
 ```bash
 cp .vmctl.env.example .vmctl.env
+chmod 600 .vmctl.env          # it contains a password
 ```
+
+`vmctl.sh` reads `.vmctl.env` from the current directory, or from the folder
+above `scripts/`. Any variable can also be exported in your shell instead.
+
+| Variable | Example | Meaning |
+|---|---|---|
+| `VMX` | `"$HOME/Virtual Machines.localized/Win11.vmwarevm/Win11.vmx"` | Full path to the VM's `.vmx`. On macOS, right-click the VM bundle > Show Package Contents. **Quote it** if it has spaces. |
+| `VM_TYPE` | `fusion` or `ws` | `fusion` on macOS, `ws` for Workstation on Windows/Linux. |
+| `GUEST_USER` | `labadmin` | Windows account used for guest operations. |
+| `GUEST_PASS` | `Passw0rd!` | Its password. Plaintext, so **throwaway lab credentials only**. |
+| `VMRUN` | `/Applications/VMware Fusion.app/Contents/Public/vmrun` | Auto-detected; set it only if detection fails. |
+| `GUEST_TMP` | `C:\Windows\Temp\vmctl` | Scratch folder in the guest. Must match `-GuestTmp` of `Enable-AgentElevation.ps1`. |
+| `ELEV_TASK` | `VMCTL-Elevated` | Scheduled task name. Must match `-TaskName`. |
+| `ELEV_TIMEOUT` | `900` | Seconds the host waits for an elevated run. **Raise to `3600` for Windows patching.** |
+| `SSH_HOST` | `192.168.1.50` | Linux guest address. Leave unset to ask VMware Tools for the IP. |
+| `SSH_USER` | `labadmin` | Linux user. Defaults to `GUEST_USER`. |
+| `SSH_KEY` | `~/.ssh/lab_key` | Private key for SSH. |
+| `SSH_PORT` | `22` | sshd port. |
+| `SSH_OPTS` | `-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10` | Extra ssh options. |
+| `SUDO` | `sudo -n` | How to become root in the guest. |
+| `LINUX_TMP` | `/tmp/vmctl` | Where `lrun` copies scripts in the guest. |
+
+Create an SSH key for the lab, if you don't have one:
 
 ```bash
-# VMware target (Windows guests)
-VMX="$HOME/Virtual Machines.localized/MyVM.vmwarevm/MyVM.vmx"
-GUEST_USER=Administrator
-GUEST_PASS=changeme
-VM_TYPE=fusion
-
-# SSH target (Linux guests). SSH_HOST autodetects from VMware Tools if unset.
-SSH_HOST=192.168.1.50
-SSH_USER=labadmin
-SSH_KEY=~/.ssh/lab_key
-SSH_PORT=22
+ssh-keygen -t ed25519 -f ~/.ssh/lab_key -C lab
+ssh-copy-id -i ~/.ssh/lab_key.pub labadmin@192.168.1.50
+ssh -i ~/.ssh/lab_key labadmin@192.168.1.50 'echo key login works'
 ```
 
-Verify, and let the tool identify the guest:
+## 7. Verify you have control of the guest
 
 ```bash
-./scripts/vmctl.sh env
-./scripts/vmctl.sh status
-./scripts/vmctl.sh detect     # identifies OS family and suggests scripts
+./scripts/vmctl.sh env        # resolved config; password shows as <set>
+./scripts/vmctl.sh status     # running=yes, tools=running, ip=...
+./scripts/vmctl.sh detect     # OS family; for Windows, whether it is a DC
+./scripts/vmctl.sh whoami     # Windows: account name + Elevated=True/False
+./scripts/vmctl.sh ssh 'id && sudo -n true && echo SUDO_OK'   # Linux
 ```
+
+| Output | Meaning | Next step |
+|---|---|---|
+| `vmrun not found` | wrong or missing VMware path | set `VMRUN=` |
+| `tools=` not `running` | VMware Tools missing or still starting | install Tools / `vmctl.sh wait-tools` |
+| `Invalid user name or password` from vmrun | wrong creds, or a blank password | set a password on the guest account |
+| `Elevated=False` | normal, see [2.3](#23-uac-token-filtering-why-administrator-is-not-elevated) | set up the elevation task (phase 3) |
+| `sudo: a password is required` | no passwordless sudo | see [2.4](#24-linux-privilege-sudo-without-a-terminal) |
+
+Full error-to-fix list: `reference/troubleshooting.md`.
 
 ---
 
-## The workflow
+# Part 3 - The workflow with scripts
 
-Same five phases for every target type.
+## 8. The six phases
+
+Same order for every target. **Don't reorder them.**
 
 ```
-0. SNAPSHOT        vmctl.sh snapshot pre-hardening
-1. AUDIT           establish a baseline, save the JSON
-2. ELEVATE         Windows: UAC bootstrap | Linux: sudo
-3. PATCH           always before hardening
-4. HARDEN          --dry-run, snapshot, apply, reboot
-5. VERIFY          re-audit, compare, clean up
+0. SNAPSHOT   so any mistake is one revert away
+1. AUDIT      read-only baseline; save the JSON to compare against later
+2. ELEVATE    Windows: elevation task | Linux: sudo
+3. PATCH      before hardening, because hardening can disable what updates need
+4. HARDEN     dry-run, read it, apply, reboot
+5. VERIFY     re-audit, compare with the baseline, clean up
 ```
 
-### Windows client or server
+Why patch first? Hardening can disable services, protocols, or script hosts
+that Windows Update, apt, or dnf depend on. A failed update after hardening
+is much harder to diagnose than one before it.
+
+## 9. Windows client or server, scripted
 
 ```bash
+# 0. snapshot
 ./scripts/vmctl.sh snapshot pre-hardening
+
+# 1. audit (non-elevated works; some checks report Unknown)
 ./scripts/vmctl.sh audit-host
-./scripts/vmctl.sh run-script scripts/windows/Invoke-HardeningAudit.ps1
-# one-time, inside the guest, elevated:  .\Enable-AgentElevation.ps1
-./scripts/vmctl.sh run-elevated scripts/windows/Invoke-Patching.ps1 -Install
+./scripts/vmctl.sh run-script scripts/windows/Invoke-HardeningAudit.ps1 -Format Console,Json
+./scripts/vmctl.sh pull 'C:\Users\labadmin\AppData\Local\Temp\vmctl\audit\audit-latest.json' ./baseline-win.json
+#    (the exact path is printed on the "JSON report:" line)
+
+# 2. elevate: ONCE, inside the guest, from "Run as administrator" PowerShell:
+#      Set-ExecutionPolicy -Scope Process Bypass
+#      .\Enable-AgentElevation.ps1
+#    then from the host:
+./scripts/vmctl.sh run-elevated scripts/windows/Invoke-HardeningAudit.ps1   # now Elevated=True
+
+# 3. patch (raise the timeout; updates are slow)
+ELEV_TIMEOUT=3600 ./scripts/vmctl.sh run-elevated scripts/windows/Invoke-Patching.ps1 -Install
 ./scripts/vmctl.sh restart
+./scripts/vmctl.sh run-script scripts/windows/Invoke-Patching.ps1 -Scan     # repeat until 0 pending
+
+# 4. harden: dry-run, read, apply, reboot
 ./scripts/vmctl.sh run-elevated scripts/windows/Invoke-Hardening.ps1 -Profile Baseline -WhatIf
 ./scripts/vmctl.sh run-elevated scripts/windows/Invoke-Hardening.ps1 -Profile Baseline
 ./scripts/vmctl.sh restart
-./scripts/vmctl.sh run-elevated scripts/windows/Invoke-HardeningAudit.ps1
+
+# 5. verify
+./scripts/vmctl.sh run-elevated scripts/windows/Invoke-HardeningAudit.ps1 -Format Console,Json
+./scripts/vmctl.sh pull 'C:\Windows\Temp\vmctl\audit\audit-latest.json' ./after-win.json
+./scripts/vmctl.sh compare baseline-win.json after-win.json
 ```
 
-### Active Directory domain controller
+> When the elevated task runs as SYSTEM, `$env:TEMP` is `C:\Windows\Temp`, so
+> elevated reports and journals land under `C:\Windows\Temp\vmctl\...`.
+> Non-elevated runs use the user's temp folder. The scripts print the path.
+
+## 10. Active Directory domain controller, scripted
 
 ```bash
-./scripts/vmctl.sh snapshot pre-ad-hardening     # snapshot EVERY DC
+./scripts/vmctl.sh snapshot pre-ad-hardening        # do this on EVERY DC
 ./scripts/vmctl.sh run-elevated scripts/windows/Invoke-ADAudit.ps1
 ./scripts/vmctl.sh run-elevated scripts/windows/Invoke-ADHardening.ps1 -Profile Baseline -WhatIf
 ./scripts/vmctl.sh run-elevated scripts/windows/Invoke-ADHardening.ps1 -Profile Baseline
@@ -160,59 +418,844 @@ Same five phases for every target type.
 ./scripts/vmctl.sh run-elevated scripts/windows/Invoke-ADAudit.ps1
 ```
 
-> AD changes are forest-wide. Snapshot **all** DCs, apply to one first, and
-> let replication converge (`repadmin /replsummary`) before the next.
+> AD changes are **forest-wide**. Snapshot all DCs, apply on one, wait for
+> replication (`repadmin /replsummary` shows 0 failures), then continue.
+> Also run the Windows procedure above on each DC; it covers the host OS.
 
-### Linux
+## 11. Linux, scripted
 
 ```bash
-./scripts/vmctl.sh lrun scripts/linux/audit.sh
+./scripts/vmctl.sh snapshot pre-hardening
+./scripts/vmctl.sh lrun --sudo scripts/linux/audit.sh --json /tmp/baseline.json
+./scripts/vmctl.sh lpull /tmp/baseline.json ./baseline-linux.json
+
 ./scripts/vmctl.sh lrun --sudo scripts/linux/patch.sh --install
-./scripts/vmctl.sh lrun --sudo scripts/linux/harden.sh --dry-run
+./scripts/vmctl.sh ssh 'sudo reboot'          # if it reports "Reboot needed : YES"
+
+./scripts/vmctl.sh lrun --sudo scripts/linux/harden.sh --dry-run --profile baseline
 ./scripts/vmctl.sh lrun --sudo scripts/linux/harden.sh --profile baseline
-./scripts/vmctl.sh lrun scripts/linux/audit.sh
+#   >>> open a SECOND ssh session now and confirm you can still log in <<<
+./scripts/vmctl.sh ssh 'sudo sshd -t && sudo systemctl restart ssh || sudo systemctl restart sshd'
+
+./scripts/vmctl.sh lrun --sudo scripts/linux/audit.sh --json /tmp/after.json
+./scripts/vmctl.sh lpull /tmp/after.json ./after-linux.json
+./scripts/vmctl.sh compare baseline-linux.json after-linux.json
 ```
 
-Or directly on the box:
+Or directly on the box, without the host wrapper:
 
 ```bash
-sudo ./audit.sh --json /tmp/audit.json
-sudo ./harden.sh --dry-run
-sudo ./harden.sh --profile baseline
+sudo sh audit.sh --json /tmp/audit.json
+sudo sh patch.sh --scan            # exit 1 = updates pending
+sudo sh patch.sh --install
+sudo sh harden.sh --dry-run --profile baseline
+sudo sh harden.sh --profile baseline
+sudo sh harden.sh --rollback /var/backups/lab-harden/<stamp>
 ```
 
-> **Never close your only SSH session** after hardening. Open a second one
-> and confirm you can still log in. `harden.sh` runs `sshd -t` automatically
-> and refuses to claim success on an invalid config.
+What `harden.sh` does to protect you:
 
----
+- **sshd drop-in:** if `sshd_config` has `Include /etc/ssh/sshd_config.d/*.conf`
+  (Ubuntu 22.04+, Debian 12+, RHEL 9+), settings go to
+  `/etc/ssh/sshd_config.d/00-lab-hardening.conf`. sshd keeps the **first**
+  value it reads, so `00-` beats a cloud-init `50-cloud-init.conf` that turns
+  passwords back on. Otherwise, settings are inserted *above* the first
+  `Match` block, because anything below `Match` only applies to that match.
+- **`sshd -t` + `sshd -T`:** syntax is validated, and the *effective* values
+  are compared with what was intended. A setting overridden elsewhere is a
+  `[FAIL]`.
+- **Keys-only lockout guard:** `HD-SSH-011` (`PasswordAuthentication no`) is
+  refused when no `authorized_keys` exists for root or any `/home/*` user,
+  unless you pass `--yes`.
+- **Firewall keeps your session:** ufw/firewalld allow the port sshd actually
+  listens on (from `sshd -T`), not just 22.
 
-## `vmctl.sh` command reference
+## 12. `vmctl.sh` command reference
 
 | Command | Purpose |
 |---|---|
-| `env` | show resolved configuration |
-| `status` | running / tools / IP |
-| `detect` | identify guest OS and suggest scripts |
-| `start [gui\|nogui]` | power on, wait for Tools |
-| `stop [secs] [soft\|hard]` | graceful stop with hard fallback |
+| `env` | show resolved configuration (password masked) |
+| `status` | running / Tools state / IP |
+| `detect` | identify guest OS family, DC role; suggest scripts |
+| `start [gui\|nogui]` | power on and wait for Tools |
+| `stop [secs] [soft\|hard]` | graceful stop with your own deadline, then hard stop |
 | `restart [secs]` | stop then start |
 | `wait-tools [secs]` | block until Tools responds |
 | `snapshot <name>` / `snapshots` / `revert <name>` / `delete-snapshot <name>` | snapshot management |
-| `push <local> <guest>` / `pull <guest> <local>` | file copy (Windows) |
-| `exists <path>` / `mkdir-guest <dir>` / `ps-list` | guest filesystem/process |
-| `ps '<code>'` / `psout '<code>'` | run PowerShell; `psout` captures stdout |
-| `run-script <ps1> [args]` | run a script non-elevated |
-| `run-elevated <ps1> [args]` | run a script with full admin rights |
+| `push <local> <guest>` / `pull <guest> <local>` | copy files to/from a Windows guest |
+| `exists <path>` / `mkdir-guest <dir>` / `ps-list` | guest filesystem and processes |
+| `ps '<code>'` / `psout '<code>'` | run PowerShell in the guest; `psout` returns its output |
+| `run-script <ps1> [args]` | run a local `.ps1` in the guest, non-elevated |
+| `run-elevated <ps1> [args]` | run a local `.ps1` elevated via the scheduled task |
 | `whoami` | guest identity and elevation state |
 | `ssh '<cmd>'` | run a command on a Linux guest |
-| `lpush` / `lpull` | file copy over SSH |
-| `lrun [--sudo] <sh> [args]` | copy and execute a shell script |
+| `lpush` / `lpull` | copy files over SSH |
+| `lrun [--sudo] <sh> [args]` | copy a shell script to the guest and run it (args are quoted safely) |
 | `audit-host` | inspect the `.vmx` for hypervisor-layer issues |
+| `compare <before.json> <after.json> [--all]` | diff two audit reports; exit 1 on any regression |
 
 Exit codes: `0` ok, `2` usage, `3` config, `4` vmrun, `5` guest, `6` timeout.
 
 ---
+
+# Part 4 - Doing everything by hand
+
+Everything below can be done without any script from this toolkit. Commands
+are what the scripts run, in the same order, with the backup step first and
+the undo step after.
+
+**Conventions:** `PS>` means elevated Windows PowerShell inside the guest
+("Run as administrator"). `$` means a Linux shell in the guest (use `sudo`
+where shown). `host$` means your host terminal.
+
+## 13. Manual phase 0: snapshot
+
+**GUI:** VMware Fusion > Virtual Machine > Snapshots > Take Snapshot. Name it
+`pre-hardening`. Workstation: VM > Snapshot > Take Snapshot.
+
+**Command line:**
+
+```bash
+host$ vmrun -T fusion snapshot "$VMX" pre-hardening
+host$ vmrun -T fusion listSnapshots "$VMX"
+host$ vmrun -T fusion revertToSnapshot "$VMX" pre-hardening    # undo everything
+host$ vmrun -T fusion deleteSnapshot "$VMX" pre-hardening      # when you're happy
+```
+
+A snapshot taken with the VM powered off is smaller and more reliable. For a
+domain, snapshot **every** DC at the same time. Reverting one DC on its own
+can cause USN rollback on older Windows versions.
+
+## 14. Manual phase 1: hypervisor (VMX) review
+
+Shut the VM down before editing the `.vmx`; Fusion rewrites it on exit.
+
+```bash
+host$ grep -iE 'firmware|secureBoot|vtpm|encryption|startConnected|sharedFolder|isolation\.tools|enable3d' "$VMX"
+```
+
+| Key | Hardened value | Why |
+|---|---|---|
+| `firmware` | `"efi"` | Needed for Secure Boot. |
+| `uefi.secureBoot.enabled` | `"TRUE"` | Blocks unsigned bootloaders/bootkits. |
+| `vtpm.present` | `"TRUE"` | BitLocker, Credential Guard, Windows 11. On Fusion it needs VM encryption first (Settings > Encryption). |
+| `sata0:0.startConnected` (CD-ROM) | `"FALSE"` | Detach install media on a finished build. |
+| `sharedFolder0.present` | `"FALSE"` | Shared folders are a host-to-guest data path. |
+| `isolation.tools.dnd.disable` | `"TRUE"` | Drag-and-drop off. |
+| `isolation.tools.copy.disable` / `paste.disable` | `"TRUE"` | Clipboard off. |
+| `isolation.tools.hgfsServerSet.disable` | `"TRUE"` | HGFS (shared folder) server off. |
+
+After editing, **re-read the file**: Fusion silently drops keys it doesn't
+like (see `reference/troubleshooting.md`). Turning off copy/paste and shared
+folders makes your own lab work harder, so decide per VM.
+
+## 15. Manual Windows procedure
+
+### 15.1 Manual audit
+
+Open **PowerShell as administrator** in the guest. Each block shows the
+current state of one area. Compare with the "Windows checks" tables in
+Part 5.
+
+```powershell
+# Identity / UAC
+Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' |
+  Select-Object EnableLUA, ConsentPromptBehaviorAdmin, FilterAdministratorToken, LocalAccountTokenFilterPolicy, InactivityTimeoutSecs
+Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' |
+  Select-Object LimitBlankPasswordUse, RestrictAnonymous, RestrictAnonymousSAM, RunAsPPL, LmCompatibilityLevel
+net accounts                                  # password + lockout policy
+Get-LocalUser | Select-Object Name, Enabled, PasswordRequired, LastLogon
+Get-LocalGroupMember Administrators
+
+# Defender
+Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled, BehaviorMonitorEnabled, AntivirusSignatureAge, IsTamperProtected
+Get-MpPreference | Select-Object PUAProtection, MAPSReporting, CloudBlockLevel, EnableNetworkProtection, EnableControlledFolderAccess
+(Get-MpPreference).AttackSurfaceReductionRules_Ids.Count
+
+# Firewall
+Get-NetFirewallProfile | Select-Object Name, Enabled, DefaultInboundAction, DefaultOutboundAction, LogBlocked
+
+# Attack surface
+Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol, MicrosoftWindowsPowerShellV2Root | Select-Object FeatureName, State
+Get-SmbServerConfiguration | Select-Object EnableSMB1Protocol, RequireSecuritySignature
+Get-Service RemoteRegistry, SSDPSRV, upnphost, Spooler, WinRM, TermService -ErrorAction SilentlyContinue |
+  Select-Object Name, Status, StartType
+
+# Logging
+auditpol /get /category:*
+Get-WinEvent -ListLog Security, System, Application | Select-Object LogName, MaximumSizeInBytes
+
+# Encryption / boot
+Confirm-SecureBootUEFI
+Get-BitLockerVolume -MountPoint C: | Select-Object VolumeStatus, ProtectionStatus
+Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard |
+  Select-Object VirtualizationBasedSecurityStatus, SecurityServicesRunning
+
+# Patching
+Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 5
+```
+
+Save the output to a file (`... | Out-File C:\baseline.txt`). That's your
+baseline.
+
+### 15.2 Elevation
+
+**Option A: work interactively.** Do everything in this Part from an
+elevated PowerShell window inside the VM. No elevation task needed, and
+nothing persistent is created. This is the simplest manual route.
+
+**Option B: build the elevation task by hand** (what
+`Enable-AgentElevation.ps1` does), so the host can trigger elevated runs:
+
+```powershell
+PS> $dir = 'C:\Windows\Temp\vmctl'
+PS> New-Item -ItemType Directory -Force $dir | Out-Null
+# Lock the folder down: whoever can write task.cmdline gets SYSTEM.
+PS> icacls $dir /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" "$env:USERDOMAIN\labadmin:(OI)(CI)M"
+#   ^ labadmin = the GUEST_USER the host uses. It needs its own grant because
+#     its filtered token has Administrators as deny-only.
+PS> Copy-Item .\elevated-runner.ps1 $dir     # the runner text is inside Enable-AgentElevation.ps1
+PS> $a = New-ScheduledTaskAction -Execute powershell.exe -Argument "-NoProfile -ExecutionPolicy Bypass -File $dir\elevated-runner.ps1"
+PS> $p = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
+PS> Register-ScheduledTask -TaskName VMCTL-Elevated -Action $a -Principal $p
+```
+
+Trigger it from the host:
+
+```bash
+host$ printf 'C:\\Windows\\Temp\\vmctl\\Invoke-HardeningAudit.ps1\r\n-Format Console\r\n' > task.cmdline
+host$ vmrun -T fusion -gu labadmin -gp 'Passw0rd!' CopyFileFromHostToGuest "$VMX" task.cmdline 'C:\Windows\Temp\vmctl\task.cmdline'
+host$ vmrun -T fusion -gu labadmin -gp 'Passw0rd!' runProgramInGuest "$VMX" C:\\Windows\\System32\\schtasks.exe "/Run /TN VMCTL-Elevated"
+# wait for C:\Windows\Temp\vmctl\elevated.done to appear, then pull elevated.log
+```
+
+**Security trade-off:** this is a deliberate, persistent privilege-escalation
+path. Remove it when you're done ([19](#19-manual-clean-up)).
+
+**Option C (not recommended): disable UAC** with `EnableLUA=0` and reboot.
+Every admin process then runs fully privileged with no prompt.
+
+### 15.3 Manual patching
+
+**GUI:** Settings > Windows Update > Check for updates. Install, reboot,
+repeat until nothing is offered. Then Windows Security > Virus & threat
+protection > Protection updates > Check for updates.
+
+**Command line:**
+
+```powershell
+# Defender signatures first (fast, independent of Windows Update)
+PS> Update-MpSignature
+PS> & "$env:ProgramFiles\Windows Defender\MpCmdRun.exe" -SignatureUpdate   # fallback
+
+# List pending updates via the Windows Update API (what Invoke-Patching.ps1 -Scan does)
+PS> $s = New-Object -ComObject Microsoft.Update.Session
+PS> $r = $s.CreateUpdateSearcher().Search("IsInstalled=0 and IsHidden=0 and Type='Software'")
+PS> $r.Updates | Select-Object Title, MsrcSeverity
+
+# Trigger a scan/download/install through the built-in orchestrator (Win10/11)
+PS> UsoClient StartInteractiveScan
+
+# Is a reboot pending?
+PS> Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+PS> Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+```
+
+If the search fails, check that `wuauserv` isn't disabled
+(`Get-Service wuauserv`), that the guest has a network route, and, behind a
+TLS-inspecting proxy, that the proxy's root CA is in
+`Cert:\LocalMachine\Root`.
+
+### 15.4 Back up before you change anything
+
+The scripts journal every value. By hand, export the keys you'll touch so
+you can re-import them:
+
+```powershell
+PS> mkdir C:\hardening-backup
+PS> reg export "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" C:\hardening-backup\uac.reg /y
+PS> reg export "HKLM\SYSTEM\CurrentControlSet\Control\Lsa"                    C:\hardening-backup\lsa.reg /y
+PS> reg export "HKLM\SYSTEM\CurrentControlSet\Control\SecurityProviders"      C:\hardening-backup\secproviders.reg /y
+PS> reg export "HKLM\SOFTWARE\Policies"                                       C:\hardening-backup\policies.reg /y
+PS> reg export "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"     C:\hardening-backup\tcpip.reg /y
+PS> reg export "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server"        C:\hardening-backup\rdp.reg /y
+PS> auditpol /backup /file:C:\hardening-backup\auditpol.csv
+PS> net accounts > C:\hardening-backup\net-accounts.txt
+PS> Get-Service | Select-Object Name, StartType, Status | Export-Csv C:\hardening-backup\services.csv -NoTypeInformation
+PS> Get-NetFirewallProfile | Export-Clixml C:\hardening-backup\fwprofiles.xml
+```
+
+Undo any registry change later with `reg import C:\hardening-backup\<file>.reg`.
+Note that import adds and overwrites values but does **not delete** values
+that didn't exist before. Delete those with `Remove-ItemProperty`.
+
+### 15.5 Manual hardening, control by control
+
+A helper so each registry control is one line:
+
+```powershell
+PS> function Set-Reg($Path, $Name, $Value, $Type = 'DWord') {
+      if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+      New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+    }
+PS> $sys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+PS> $lsa = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
+```
+
+#### Identity and authentication
+
+| ID | Profile | Do it | Undo |
+|---|---|---|---|
+| HD-ID-001 | B | `Set-Reg $sys EnableLUA 1` (UAC on, needs reboot) | restore from `uac.reg` |
+| HD-ID-002 | B | `Set-Reg $sys ConsentPromptBehaviorAdmin 2` (prompt on secure desktop) | default is `5` |
+| HD-ID-003 | B | `Set-Reg $sys FilterAdministratorToken 1` | `0` |
+| HD-ID-004 | B | `Set-Reg $sys InactivityTimeoutSecs 900` | `Remove-ItemProperty $sys InactivityTimeoutSecs` |
+| HD-ID-005 | B | `Set-Reg $lsa LimitBlankPasswordUse 1` | `0` |
+| HD-ID-006 | B | `Set-Reg $lsa RestrictAnonymous 1` | `0` |
+| HD-ID-007 | B | `Set-Reg $lsa RestrictAnonymousSAM 1` | `0` |
+| HD-ID-008 | S | `Set-Reg $lsa RunAsPPL 1` (reboot). LSASS becomes a protected process, so Mimikatz-style dumping fails. Some old AV/credential providers break. | `Remove-ItemProperty $lsa RunAsPPL` + reboot. On UEFI with Secure Boot it can be stored in a UEFI variable; see Microsoft's "Configure added LSA protection" to remove. |
+| HD-ID-009 | B | `Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' UseLogonCredential 0` | remove the value |
+| HD-ID-010 | B | `net accounts /minpwlen:14 /uniquepw:5 /maxpwage:90` | values in `net-accounts.txt` |
+| HD-ID-011 | B | `net accounts /lockoutthreshold:5 /lockoutduration:15 /lockoutwindow:15` | `net accounts /lockoutthreshold:0` |
+| HD-ID-012 | B | `Disable-LocalUser Guest` | `Enable-LocalUser Guest` |
+
+#### Microsoft Defender
+
+| ID | Profile | Do it | Undo |
+|---|---|---|---|
+| HD-DEF-001 | B | `Set-MpPreference -DisableRealtimeMonitoring $false` | `$true` |
+| HD-DEF-002 | B | `Set-MpPreference -DisableBehaviorMonitoring $false` | `$true` |
+| HD-DEF-003 | B | `Set-MpPreference -DisableScriptScanning $false -DisableIOAVProtection $false` | `$true` |
+| HD-DEF-004 | B | `Set-MpPreference -PUAProtection Enabled` | `Disabled` |
+| HD-DEF-005 | B | `Set-MpPreference -MAPSReporting Advanced -SubmitSamplesConsent SendSafeSamples -CloudBlockLevel High -CloudExtendedTimeout 50` | `-CloudBlockLevel Default` |
+| HD-DEF-006 | S | `Set-MpPreference -EnableNetworkProtection Enabled` | `Disabled` |
+| HD-DEF-007 | P | `Set-MpPreference -EnableControlledFolderAccess Enabled` (can block legitimate apps writing to Documents) | `Disabled` |
+| HD-DEF-008 | S | ASR rules in block mode; the full list of GUIDs is under "ASR rules applied by `-Profile Strict`" in Part 5. `Add-MpPreference -AttackSurfaceReductionRules_Ids <guid> -AttackSurfaceReductionRules_Actions Enabled` | `Remove-MpPreference -AttackSurfaceReductionRules_Ids <guid>`, or set the action to `AuditMode` to observe first |
+
+If **Tamper Protection** is on, some `Set-MpPreference` changes are silently
+ignored. Check with `(Get-MpComputerStatus).IsTamperProtected`. Toggle it
+in Windows Security > Virus & threat protection settings.
+
+#### Firewall
+
+```powershell
+PS> Set-NetFirewallProfile -All -Enabled True -DefaultInboundAction Block -DefaultOutboundAction Allow   # HD-FW-001 (B)
+PS> Set-NetFirewallProfile -All -LogBlocked True -LogMaxSizeKilobytes 16384 `
+      -LogFileName '%systemroot%\system32\LogFiles\Firewall\pfirewall.log'                               # HD-FW-002 (B)
+PS> Get-NetFirewallRule -DisplayGroup 'File and Printer Sharing' |
+      Where-Object { $_.Profile -match 'Public' } | Disable-NetFirewallRule                              # HD-FW-003 (S)
+```
+
+`DefaultInboundAction Block` still allows inbound traffic that matches an
+**allow rule** (RDP, WinRM, if enabled). VMware Tools uses VMCI, not the
+network, so guest operations keep working. Undo:
+`Set-NetFirewallProfile -All -DefaultInboundAction NotConfigured`.
+
+#### Attack surface
+
+| ID | Profile | Do it | Why |
+|---|---|---|---|
+| HD-SU-001 | B | `Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' EnableMulticast 0` | LLMNR poisoning (Responder) |
+| HD-SU-002 | B | `Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' NoDriveTypeAutoRun 255` | AutoRun malware |
+| HD-SU-003 | B | `Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' NoAutorun 1` | AutoRun commands |
+| HD-SU-004 | B | NetBIOS over TCP/IP off: `Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters\Interfaces' \| % { Set-ItemProperty $_.PSPath NetbiosOptions 2 }` (undo: `0` = DHCP default) | NBT-NS poisoning |
+| HD-SU-005 | B | `Set-SmbServerConfiguration -RequireSecuritySignature $true -EnableSecuritySignature $true -Force; Set-SmbClientConfiguration -RequireSecuritySignature $true -EnableSecuritySignature $true -Force` | NTLM relay over SMB |
+| HD-SU-006 | S | `Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart` (undo: `Enable-...`) | EternalBlue/WannaCry class |
+| HD-SU-007 | S | `Disable-WindowsOptionalFeature -Online -FeatureName MicrosoftWindowsPowerShellV2Root -NoRestart` | PSv2 bypasses AMSI and logging |
+| HD-SU-008 | S | `Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings' Enabled 0` | .vbs/.js droppers |
+| HD-SU-009 | B | `Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' UserAuthentication 1` | RDP requires NLA |
+| HD-SU-010 | B | `Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' MinEncryptionLevel 3` | RDP high encryption |
+
+#### Services
+
+```powershell
+PS> foreach ($s in 'RemoteRegistry','SSDPSRV','upnphost') {                  # Baseline
+      Stop-Service $s -Force -ErrorAction SilentlyContinue; Set-Service $s -StartupType Disabled }
+PS> foreach ($s in 'Spooler','SharedAccess','RemoteAccess') { ... same ... } # Strict
+PS> foreach ($s in 'WinRM','TermService') { ... same ... }                   # Paranoid: removes RDP + WinRM!
+```
+
+Undo: `Set-Service <name> -StartupType Manual` (or `Automatic`; check
+`services.csv` from 15.4), then `Start-Service <name>`. The scripted rollback
+does this for you from the journal.
+
+#### Logging and audit
+
+```powershell
+PS> Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging' EnableScriptBlockLogging 1   # HD-LOG-001
+PS> Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging' EnableModuleLogging 1             # HD-LOG-002
+PS> Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging\ModuleNames' '*' '*' String        # HD-LOG-003
+PS> Set-Reg "$sys\Audit" ProcessCreationIncludeCmdLine_Enabled 1                                                    # HD-LOG-004
+# HD-LOG-005: audit policy (back up first: auditpol /backup /file:C:\hardening-backup\auditpol.csv)
+PS> 'Process Creation','Special Logon','Logoff' | % { auditpol /set /subcategory:"$_" /success:enable /failure:disable }
+PS> 'Logon','Account Lockout','Security Group Management','User Account Management','Audit Policy Change',
+    'Authentication Policy Change','Sensitive Privilege Use','Security System Extension','System Integrity' |
+    % { auditpol /set /subcategory:"$_" /success:enable /failure:enable }
+# HD-LOG-006: bigger logs (192 MB)
+PS> 'Security','System','Application' | % { wevtutil sl $_ /ms:201326592 }
+```
+
+Undo the audit policy: `auditpol /restore /file:C:\hardening-backup\auditpol.csv`.
+Where to look afterwards: Event Viewer > Applications and Services Logs >
+Microsoft > Windows > PowerShell > Operational (event 4104), and Security
+log events 4688, 4624, 4625, 4740.
+
+> Subcategory names in `auditpol` are **localized**. On a non-English Windows,
+> use the GUIDs from `auditpol /list /subcategory:* /v`.
+
+#### Network and TLS
+
+```powershell
+# HD-NET-001..010 (Strict): SSL 2.0/3.0, TLS 1.0/1.1 off; TLS 1.2 on, for Server and Client
+PS> $sc = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols'
+PS> foreach ($p in 'SSL 2.0','SSL 3.0','TLS 1.0','TLS 1.1') { foreach ($r in 'Server','Client') { Set-Reg "$sc\$p\$r" Enabled 0 } }
+PS> foreach ($r in 'Server','Client') { Set-Reg "$sc\TLS 1.2\$r" Enabled 1 }
+PS> Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters' AllowInsecureGuestAuth 0  # HD-NET-100 (B)
+PS> Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Network Connections' NC_AllowNetBridge_NLA 0           # HD-NET-101 (S)
+PS> Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' DisableIPSourceRouting 2              # HD-NET-102 (B)
+PS> Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' EnableICMPRedirect 0                  # HD-NET-103 (B)
+```
+
+Disabling TLS 1.0/1.1 breaks old clients and old SQL Server/.NET apps that
+don't negotiate TLS 1.2. Test what talks to the box first.
+
+### 15.6 Reboot and verify
+
+```powershell
+PS> Restart-Computer
+```
+
+Settings that **need a reboot**: `EnableLUA`, `RunAsPPL`, SMBv1/PSv2 feature
+removal, SCHANNEL/TLS. Verify after the reboot by re-running the block from
+15.1, and spot-check:
+
+```powershell
+PS> Get-Process lsass | Select-Object Name, Id    # then try: procdump -ma lsass -> should fail with RunAsPPL
+PS> Get-WinEvent -FilterHashtable @{LogName='System'; Id=12} -MaxEvents 1   # LSA protection startup event
+PS> Resolve-DnsName -LlmnrOnly nonexistent-host   # should fail fast with LLMNR off
+```
+
+## 16. Manual Active Directory procedure
+
+Run in an elevated PowerShell **on a DC** (or a member with RSAT) as a
+Domain Admin. `Import-Module ActiveDirectory` first.
+
+### 16.1 Back up
+
+1. Snapshot **every** DC (VM powered off is best).
+2. Export what you'll change:
+
+```powershell
+PS> $d = Get-ADDomain
+PS> Get-ADObject $d.DistinguishedName -Properties ms-DS-MachineAccountQuota | Select-Object ms-DS-MachineAccountQuota
+PS> Get-ADDefaultDomainPasswordPolicy | Export-Clixml C:\ad-backup\pwpolicy.xml
+PS> 'Domain Admins','Account Operators','Server Operators','Print Operators' |
+      % { Get-ADGroupMember $_ -Recursive | Select-Object @{n='Group';e={$_}}, SamAccountName } |
+      Export-Csv C:\ad-backup\groups.csv -NoTypeInformation
+PS> Get-ADUser -Filter {DoesNotRequirePreAuth -eq $true} | Select SamAccountName | Export-Csv C:\ad-backup\nopreauth.csv
+PS> Get-ADComputer -Filter {TrustedForDelegation -eq $true} | Select Name | Export-Csv C:\ad-backup\unconstrained.csv
+PS> reg export HKLM\SYSTEM\CurrentControlSet\Services\NTDS\Parameters C:\ad-backup\ntds.reg /y
+PS> auditpol /backup /file:C:\ad-backup\auditpol.csv
+```
+
+### 16.2 Manual audit (the highest-value checks)
+
+```powershell
+PS> Get-ADUser -Filter {ServicePrincipalName -like '*'} -Properties ServicePrincipalName, PasswordLastSet |
+      Select SamAccountName, PasswordLastSet                          # kerberoastable accounts
+PS> Get-ADUser -Filter {DoesNotRequirePreAuth -eq $true}              # AS-REP roastable
+PS> Get-ADComputer -Filter {TrustedForDelegation -eq $true}           # unconstrained delegation
+PS> Get-ADUser krbtgt -Properties PasswordLastSet                     # should be < 180 days
+PS> Get-ADGroupMember 'Domain Admins' -Recursive
+PS> Get-ADOptionalFeature -Filter * | Select Name, EnabledScopes       # Recycle Bin
+PS> Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters |
+      Select LDAPServerIntegrity, LdapEnforceChannelBinding
+PS> Get-Service Spooler
+PS> repadmin /replsummary
+PS> dcdiag /q
+```
+
+AD CS (ESC1-ESC4) needs `certutil -v -template` or a tool such as Certify or
+Certipy, and judgement about who legitimately enrols. Those findings are
+reported, never auto-fixed.
+
+### 16.3 Manual hardening, control by control
+
+| ID | Profile | Do it | Undo / risk |
+|---|---|---|---|
+| ADH-001 | B | `Set-ADObject (Get-ADDomain).DistinguishedName -Replace @{'ms-DS-MachineAccountQuota'=0}` | Default is `10`. With 0, ordinary users can no longer join computers to the domain (blocks RBCD abuse). |
+| ADH-002 | B | `Enable-ADOptionalFeature 'Recycle Bin Feature' -Scope ForestOrConfigurationSet -Target (Get-ADForest).Name` | **Irreversible.** Safe and recommended. |
+| ADH-003 | B | `Set-ADDefaultDomainPasswordPolicy -Identity (Get-ADDomain).DNSRoot -MinPasswordLength 14 -PasswordHistoryCount 24 -ComplexityEnabled $true -LockoutThreshold 5 -LockoutDuration 00:15:00 -LockoutObservationWindow 00:15:00 -ReversibleEncryptionEnabled $false` | Restore values from `pwpolicy.xml`. |
+| ADH-010 | B | `Get-ADGroupMember 'Domain Admins' -Recursive \| ? objectClass -eq user \| % { Set-ADUser $_ -AccountNotDelegated $true }` | `-AccountNotDelegated $false` |
+| ADH-011 | S | Remove all members of Account/Server/Print Operators: `Remove-ADGroupMember '<group>' -Members <user> -Confirm:$false` | re-add from `groups.csv` |
+| ADH-012 | B | `Get-ADUser -Filter {DoesNotRequirePreAuth -eq $true -and Enabled -eq $true} \| Set-ADAccountControl -DoesNotRequirePreAuth $false` | from `nopreauth.csv` |
+| ADH-013 | B | `Get-ADUser -Filter {AllowReversiblePasswordEncryption -eq $true} \| Set-ADUser -AllowReversiblePasswordEncryption $false` | |
+| ADH-014 | S | For each non-DC in `unconstrained.csv`: `Set-ADAccountControl <computer> -TrustedForDelegation $false` | Breaks apps that rely on unconstrained delegation; move them to constrained/RBCD. |
+
+DC-local settings (run on **each** DC):
+
+| ID | Profile | Do it | Risk |
+|---|---|---|---|
+| ADH-020 | B | `Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters' LDAPServerIntegrity 2` | Rejects unsigned simple binds. Check Directory Service event 2889 first to find clients that would break. |
+| ADH-021 | B | `... LdapEnforceChannelBinding 1` (when supported) | Low: only clients that send channel-binding tokens are checked. |
+| ADH-028 | S | `... LdapEnforceChannelBinding 2` (always) | Rejects LDAPS clients without CBT support. |
+| ADH-022 | B | `Stop-Service Spooler -Force; Set-Service Spooler -StartupType Disabled` | A DC almost never needs to print. Blocks the PrinterBug coercion. |
+| ADH-023 | B | `Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0' AuditReceivingNTLMTraffic 2` | Audit only. Read Applications and Services > Microsoft > Windows > NTLM > Operational. |
+| ADH-024 | P | `... RestrictNTLMInDomain 7` | **Denies all NTLM.** Only after weeks of auditing show nothing breaks. |
+| ADH-025 | S | `Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' RunAsPPL 1` + reboot | as HD-ID-008 |
+| ADH-026 | B | `Set-SmbServerConfiguration -RequireSecuritySignature $true -Force` | |
+| ADH-027 | S | `Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters' SupportedEncryptionTypes 24` | AES only. **Rotate `krbtgt` twice and any old service-account passwords first**, or accounts without AES keys can't get tickets. |
+| ADH-030 | B | `auditpol /set /subcategory:"Directory Service Changes" /success:enable /failure:enable`, and the same for Directory Service Access, Kerberos Authentication Service, Kerberos Service Ticket Operations, Credential Validation, Security Group / User Account / Computer Account Management, Logon, Account Lockout; Process Creation success only | `auditpol /restore /file:C:\ad-backup\auditpol.csv` |
+| ADH-031 | B | `wevtutil sl Security /ms:1073741824` (1 GB) | |
+
+Production domains normally set these through **Group Policy** (Default
+Domain Controllers Policy) rather than direct registry writes, so they stay
+consistent and can't drift. In a lab, direct writes are fine.
+
+### 16.4 Replication and verification
+
+```powershell
+PS> repadmin /syncall /AdeP          # push changes now
+PS> repadmin /replsummary            # 0 fails before you touch the next DC
+PS> dcdiag /q                        # no output = healthy
+PS> Restart-Computer                 # LSASS PPL, LDAP signing, Kerberos enc types
+```
+
+## 17. Manual Linux procedure
+
+All commands run as root (`sudo -i`) in the guest. Keep **two SSH sessions
+open** the whole time.
+
+### 17.1 Manual audit
+
+```bash
+$ . /etc/os-release; echo "$PRETTY_NAME"; uname -r
+# Identity
+$ awk -F: '($2 == "") {print $1}' /etc/shadow           # empty passwords (ID-001)
+$ awk -F: '($3 == 0) {print $1}' /etc/passwd            # UID 0 accounts (ID-002)
+$ grep -E '^(PASS_MAX_DAYS|PASS_MIN_DAYS|PASS_WARN_AGE|UMASK)' /etc/login.defs
+$ grep -rE '^[^#]*NOPASSWD' /etc/sudoers /etc/sudoers.d/
+# SSH: the EFFECTIVE config (includes drop-ins and defaults)
+$ sshd -T | grep -E '^(permitrootlogin|passwordauthentication|permitemptypasswords|x11forwarding|maxauthtries|clientalive|logingracetime|hostbased|ignorerhosts|permituserenvironment|allowtcpforwarding|loglevel) '
+$ ls -l /etc/ssh/ssh_host_*_key
+# Kernel
+$ sysctl net.ipv4.ip_forward net.ipv4.conf.all.accept_redirects net.ipv4.conf.default.accept_redirects \
+         net.ipv4.conf.all.rp_filter kernel.randomize_va_space kernel.kptr_restrict kernel.yama.ptrace_scope
+# Filesystem
+$ stat -c '%a %n' /etc/passwd /etc/group /etc/shadow /etc/ssh/sshd_config
+$ find / -xdev -type f -perm -0002 -not -path '/proc/*' -not -path '/tmp/*' 2>/dev/null | head
+$ find / -xdev -type f -perm -4000 2>/dev/null | wc -l
+$ findmnt /tmp
+# Services, network, firewall
+$ systemctl list-units --type=service --state=running
+$ ss -lntup
+$ ufw status verbose || firewall-cmd --list-all || nft list ruleset
+# Logging, MAC
+$ systemctl is-active auditd rsyslog systemd-journald; auditctl -l | head
+$ getenforce 2>/dev/null || aa-status 2>/dev/null | head -3
+```
+
+### 17.2 Manual patching
+
+| Distro | Refresh + list | Install all | Security only |
+|---|---|---|---|
+| Debian/Ubuntu | `apt-get update && apt list --upgradable` | `apt-get -o Dpkg::Options::=--force-confold --with-new-pkgs upgrade` | `apt-get install unattended-upgrades && unattended-upgrade -v` |
+| RHEL/Rocky/Alma/Fedora | `dnf check-update` (exit 100 = updates) | `dnf -y upgrade` | `dnf -y upgrade --security` |
+| SUSE | `zypper refresh && zypper list-updates` | `zypper update` | `zypper patch --category security` |
+| Alpine | `apk update && apk version -l '<'` | `apk upgrade` | - |
+| Arch | `pacman -Sy && pacman -Qu` | `pacman -Su` | - |
+
+Why `--with-new-pkgs`: plain `apt-get upgrade` **keeps back** packages that
+need a new dependency, and new kernels are exactly that. Why
+`--force-confold`: keeps your edited config files instead of stopping to ask.
+
+Reboot needed?
+
+```bash
+$ [ -f /var/run/reboot-required ] && cat /var/run/reboot-required      # Debian/Ubuntu
+$ needs-restarting -r                                                    # RHEL family (dnf-utils)
+$ ls /lib/modules/"$(uname -r)" >/dev/null || echo "running kernel removed: reboot"   # Arch/Alpine
+```
+
+### 17.3 Back up before you change anything
+
+```bash
+$ B=/var/backups/manual-harden-$(date +%Y%m%d-%H%M%S); mkdir -p -m 700 "$B"
+$ cp -a /etc/ssh /etc/login.defs /etc/security /etc/sysctl.d /etc/issue /etc/issue.net /etc/motd "$B"/ 2>/dev/null
+$ stat -c '%a %n' /etc/passwd /etc/group /etc/shadow /etc/ssh/sshd_config > "$B/perms.txt"
+$ systemctl list-unit-files --state=enabled > "$B/enabled-units.txt"
+```
+
+### 17.4 Manual hardening, area by area
+
+#### Kernel parameters (HD-KN-001..017)
+
+Put them in one file, so undo is deleting it:
+
+```bash
+$ cat > /etc/sysctl.d/99-lab-hardening.conf <<'EOF'
+net.ipv4.ip_forward = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+kernel.randomize_va_space = 2
+fs.suid_dumpable = 0
+kernel.dmesg_restrict = 1
+# strict:
+kernel.kptr_restrict = 2
+kernel.yama.ptrace_scope = 1
+EOF
+$ sysctl --system                       # apply now
+```
+
+Don't set `ip_forward = 0` on a host that runs Docker, Kubernetes, libvirt
+NAT, or is a router; it breaks container networking. `ptrace_scope = 1`
+breaks attaching `gdb`/`strace` to processes you didn't start.
+**Undo:** `rm /etc/sysctl.d/99-lab-hardening.conf && sysctl --system` (live
+values return to defaults fully only after a reboot).
+
+#### SSH daemon (HD-SSH-001..013)
+
+First decide **where** settings go. sshd keeps the **first** value it reads
+for each keyword:
+
+```bash
+$ grep -n '^Include' /etc/ssh/sshd_config
+```
+
+- If you see `Include /etc/ssh/sshd_config.d/*.conf`: create
+  `/etc/ssh/sshd_config.d/00-lab-hardening.conf` (the `00-` makes it load
+  first, ahead of `50-cloud-init.conf` and similar).
+- If not: edit `/etc/ssh/sshd_config` and put the lines **above** any
+  `Match` block.
+
+```bash
+$ cat > /etc/ssh/sshd_config.d/00-lab-hardening.conf <<'EOF'
+PermitRootLogin no
+PermitEmptyPasswords no
+MaxAuthTries 4
+X11Forwarding no
+IgnoreRhosts yes
+HostbasedAuthentication no
+ClientAliveInterval 300
+ClientAliveCountMax 3
+LoginGraceTime 60
+PermitUserEnvironment no
+LogLevel VERBOSE
+# strict - ONLY after proving key login works in another session:
+# PasswordAuthentication no
+# AllowTcpForwarding no
+EOF
+$ sshd -t && echo SYNTAX_OK              # never restart without this
+$ sshd -T | grep -E '^(permitrootlogin|passwordauthentication|x11forwarding|clientalivecountmax) '
+$ systemctl restart ssh 2>/dev/null || systemctl restart sshd
+```
+
+Then, **from a new terminal**, log in again. Only close the old session if
+that works.
+
+Notes:
+- `ClientAliveCountMax 0` used to mean "disconnect on first missed
+  keepalive". Since OpenSSH 8.2 it **disables** that termination, so `3` is
+  used.
+- Before `PasswordAuthentication no`, confirm a key works:
+  `ssh -o PreferredAuthentications=publickey -o PasswordAuthentication=no user@host true`.
+
+**Undo:** `rm /etc/ssh/sshd_config.d/00-lab-hardening.conf` (or restore
+`sshd_config` from the backup), `sshd -t`, restart.
+
+#### Accounts and passwords (HD-ID-001..013)
+
+```bash
+# /etc/login.defs: affects NEW accounts and new password changes
+$ sed -i -E 's/^#?[[:space:]]*PASS_MAX_DAYS.*/PASS_MAX_DAYS\t90/; s/^#?[[:space:]]*PASS_MIN_DAYS.*/PASS_MIN_DAYS\t1/; s/^#?[[:space:]]*PASS_WARN_AGE.*/PASS_WARN_AGE\t7/; s/^#?[[:space:]]*UMASK.*/UMASK\t\t027/' /etc/login.defs
+$ chage -M 90 -m 1 -W 7 labadmin          # existing accounts are NOT changed by login.defs
+
+# password quality (Debian: apt install libpam-pwquality)
+$ sed -i -E 's/^#?[[:space:]]*minlen.*/minlen = 14/' /etc/security/pwquality.conf
+#   strict: dcredit = -1, ucredit = -1, lcredit = -1, ocredit = -1
+
+# lockout (faillock)
+$ sed -i -E 's/^#?[[:space:]]*deny.*/deny = 5/; s/^#?[[:space:]]*unlock_time.*/unlock_time = 900/' /etc/security/faillock.conf
+#   faillock.conf only takes effect if pam_faillock is in the PAM stack:
+#   RHEL: authselect enable-feature with-faillock | Ubuntu: add pam_faillock to common-auth
+$ faillock --user labadmin                # see / reset with --reset
+
+# no core dumps
+$ echo '* hard core 0' > /etc/security/limits.d/99-lab-hardening.conf
+```
+
+If a `grep` for the key shows nothing (the line didn't exist), `sed` changed
+nothing. Append it instead, e.g. `echo 'minlen = 14' >> /etc/security/pwquality.conf`.
+
+#### Services (HD-SV-001..009)
+
+```bash
+$ for s in avahi-daemon cups rpcbind telnet.socket; do systemctl disable --now "$s" 2>/dev/null; done   # baseline
+$ for s in vsftpd snmpd nfs-server smbd xinetd;   do systemctl disable --now "$s" 2>/dev/null; done   # strict
+```
+
+Some come back through **socket activation** (`cups.socket`,
+`rpcbind.socket`, `avahi-daemon.socket`). Disable the socket too, or
+`systemctl mask <unit>` to block it completely.
+**Undo:** `systemctl enable --now <unit>` (check `enabled-units.txt`).
+
+#### Firewall (HD-FW-001)
+
+Find the SSH port first: `sshd -T | awk '$1=="port"'`.
+
+```bash
+# Debian/Ubuntu
+$ ufw default deny incoming && ufw default allow outgoing
+$ ufw allow 22/tcp            # your real SSH port
+$ ufw --force enable && ufw status verbose
+# undo: ufw disable
+
+# RHEL/Fedora/SUSE
+$ systemctl enable --now firewalld
+$ firewall-cmd --permanent --add-service=ssh   # or --add-port=2222/tcp
+$ firewall-cmd --reload && firewall-cmd --list-all
+# undo: systemctl disable --now firewalld
+```
+
+#### Logging and audit (HD-LG-001..003)
+
+```bash
+$ apt install auditd || dnf install audit      # if missing
+$ systemctl enable --now auditd
+$ mkdir -p /var/log/journal && systemd-tmpfiles --create --prefix /var/log/journal   # persistent journal
+$ systemctl restart systemd-journald
+```
+
+Audit rules (strict). Only add `-w` watches for paths that **exist**; a
+missing path makes `auditctl` reject the rule:
+
+```bash
+$ cat > /etc/audit/rules.d/99-lab-hardening.rules <<'EOF'
+-w /etc/passwd -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/sudoers -p wa -k scope
+-w /etc/sudoers.d/ -p wa -k scope
+-a always,exit -F arch=b64 -S execve -C uid!=euid -F euid=0 -k setuid_exec
+-a always,exit -F arch=b64 -S init_module,delete_module -k modules
+-a always,exit -F arch=b64 -S adjtimex,settimeofday -k time-change
+EOF
+$ augenrules --load && auditctl -l
+$ ausearch -k identity -ts recent        # see what got logged
+```
+
+#### Filesystem (HD-FS-001..006)
+
+```bash
+$ chmod 644 /etc/passwd /etc/group
+$ chmod 600 /etc/ssh/sshd_config
+$ chmod 640 /etc/shadow        # Debian/Ubuntu (group shadow); RHEL ships 000
+# strict: stop rarely-used kernel modules from loading
+$ for m in cramfs freevxfs jffs2 hfs hfsplus udf dccp sctp rds tipc; do echo "install $m /bin/true"; done \
+    > /etc/modprobe.d/99-lab-hardening.conf
+```
+
+`udf` is needed to mount some DVD/ISO images. Remove its line if you use
+them. **Undo:** `chmod` back to the modes in `perms.txt`; delete the modprobe
+file.
+
+`/tmp` with `noexec,nosuid,nodev` (paranoid) is **manual only**. A wrong
+`fstab` line can stop the system booting:
+
+```bash
+$ systemctl cat tmp.mount            # many distros ship one
+$ mkdir -p /etc/systemd/system/tmp.mount.d
+$ printf '[Mount]\nOptions=mode=1777,strictatime,nosuid,nodev,noexec\n' > /etc/systemd/system/tmp.mount.d/options.conf
+$ systemctl daemon-reload && systemctl enable --now tmp.mount && findmnt /tmp
+```
+
+Some installers and package scripts execute from `/tmp`. If one fails, set
+`TMPDIR=/var/tmp` for that run.
+
+#### Login banner (HD-BN-001)
+
+```bash
+$ msg='Authorized access only. All activity is monitored and logged.'
+$ for f in /etc/issue /etc/issue.net /etc/motd; do printf '%s\n' "$msg" > "$f"; done
+$ echo 'Banner /etc/issue.net' > /etc/ssh/sshd_config.d/01-banner.conf   # show it before SSH login too
+```
+
+### 17.5 Verify
+
+```bash
+$ sshd -t && sshd -T | grep -E '^(permitrootlogin|passwordauthentication) '
+$ sysctl kernel.randomize_va_space net.ipv4.conf.all.accept_redirects
+$ ufw status || firewall-cmd --state
+$ reboot                                   # sysctl + modules settle fully
+```
+
+### 17.6 Manual rollback
+
+```bash
+$ cp -a "$B"/ssh/. /etc/ssh/ && rm -f /etc/ssh/sshd_config.d/00-lab-hardening.conf
+$ cp -a "$B"/login.defs /etc/ && cp -a "$B"/security/. /etc/security/
+$ rm -f /etc/sysctl.d/99-lab-hardening.conf /etc/modprobe.d/99-lab-hardening.conf \
+        /etc/security/limits.d/99-lab-hardening.conf /etc/audit/rules.d/99-lab-hardening.rules
+$ while read -r mode path; do chmod "$mode" "$path"; done < "$B/perms.txt"
+$ sshd -t && systemctl restart ssh 2>/dev/null || systemctl restart sshd
+$ sysctl --system; augenrules --load 2>/dev/null
+```
+
+## 18. Manual verification: comparing before and after
+
+Scripted: `vmctl.sh compare baseline.json after.json` prints the score
+change, every check that improved, every check that **regressed**, and the
+Critical/High failures still open. It exits `1` if anything regressed.
+
+By hand with `jq`:
+
+```bash
+host$ jq -r '.results[] | "\(.id) \(.status)"' baseline-linux.json | sort > before.txt
+host$ jq -r '.results[] | "\(.id) \(.status)"' after-linux.json    | sort > after.txt
+host$ diff before.txt after.txt
+# Windows JSON uses capitalised keys and a BOM:
+host$ sed '1s/^\xEF\xBB\xBF//' after-win.json | jq -r '.Results[] | "\(.Id) \(.Status)"'
+```
+
+What to look for:
+
+- **Regressions** (PASS to FAIL/WARN): something you changed broke
+  something else, or a reboot reverted a setting. Investigate before going on.
+- **Still failing Critical/High:** usually needs a manual decision (BitLocker,
+  GRUB password, AD CS templates, remote log collector).
+- **Unknown:** usually the audit ran non-elevated. Re-run elevated.
+
+## 19. Manual clean-up
+
+```powershell
+# Windows: remove the elevation path and the temp folder
+PS> .\Enable-AgentElevation.ps1 -Remove
+#   or by hand:
+PS> Unregister-ScheduledTask -TaskName VMCTL-Elevated -Confirm:$false
+PS> Remove-Item C:\Windows\Temp\vmctl -Recurse -Force
+PS> net user labadmin *          # rotate the password that sat in .vmctl.env
+```
+
+```bash
+# Linux: remove the temporary sudo rule and the copied scripts
+$ rm -f /etc/sudoers.d/90-lab-temp /tmp/vmctl/*
+# Host
+host$ rm .vmctl.env              # or at least blank GUEST_PASS
+host$ vmrun -T fusion snapshot "$VMX" hardened-$(date +%Y%m%d)   # known-good point
+```
+
+---
+
+# Part 5 - Reference
 
 # Windows checks
 
@@ -690,7 +1733,7 @@ Get-ADObject -SearchBase "CN=Certificate Templates,CN=Public Key Services,CN=Ser
 |---|---|---|
 | AD-081 | More than one DC | Resilience. |
 | AD-083 | **LDAP signing required** (`LDAPServerIntegrity=2`) | Blocks LDAP relay. |
-| AD-084 | **LDAP channel binding enforced** | Blocks relay to LDAPS. |
+| AD-084 | **LDAP channel binding enforced** | Blocks relay to LDAPS. Hardening sets `1` (when supported) in Baseline (ADH-021) and `2` (always) in Strict (ADH-028). |
 | AD-085 | SMB signing required on DC | Unsigned SMB on a DC enables NTLM relay to SYSTEM. |
 | AD-086 | **Print Spooler disabled on DC** | PrinterBug coerces DC authentication to an attacker host. |
 | AD-087 | NTLM auditing enabled | Audit before restricting, so you know what breaks. |
@@ -748,7 +1791,7 @@ grep -rE '^[^#]*NOPASSWD' /etc/sudoers /etc/sudoers.d/
 
 ## SSH daemon (SSH-001 — SSH-011)
 
-Read via `sshd -T` (authoritative effective config) with a config-file fallback.
+Read via `sshd -T` (authoritative effective config, needs root) with a config-file fallback that follows sshd's **first-match-wins** rule, reads `sshd_config.d/` drop-ins first when they are `Include`d, and ignores `Match` blocks.
 
 | ID | Setting | Why it matters |
 |---|---|---|
@@ -757,7 +1800,7 @@ Read via `sshd -T` (authoritative effective config) with a config-file fallback.
 | SSH-003 | `PermitEmptyPasswords no` | |
 | SSH-004 | `X11Forwarding no` | X11 forwarding can expose the client's display. |
 | SSH-005 | `MaxAuthTries 4` | Limits guesses per connection. |
-| SSH-006 | `ClientAliveInterval` ≤ 900 | Idle sessions are hijackable. |
+| SSH-006 | `ClientAliveInterval` ≤ 900 (with `ClientAliveCountMax 3`) | Dead sessions are reaped. Note `ClientAliveCountMax 0` *disables* this on OpenSSH ≥ 8.2. |
 | SSH-007 | `LoginGraceTime` ≤ 60 | Limits unauthenticated connection slots. |
 | SSH-008 | `HostbasedAuthentication no` | Trust-based auth is spoofable. |
 | SSH-009 | `IgnoreRhosts yes` | Legacy trust files. |
@@ -772,7 +1815,7 @@ sudo sshd -t          # ALWAYS validate before restarting
 > **Always keep a second session open** when changing SSH. `harden.sh` runs
 > `sshd -t` and reports failure rather than leaving you locked out.
 
-## Kernel parameters (KN-001 — KN-014)
+## Kernel parameters (KN-001 — KN-017)
 
 | ID | Parameter | Expected | Why |
 |---|---|---|---|
@@ -789,11 +1832,14 @@ sudo sshd -t          # ALWAYS validate before restarting
 | KN-012 | `kernel.kptr_restrict` | 2 | Hides kernel pointers. |
 | KN-013 | `net.ipv6.conf.all.accept_redirects` | 0 | IPv6 equivalent of KN-002. |
 | KN-014 | **`kernel.yama.ptrace_scope`** | 1 | Restricts `ptrace` to descendants; blocks cross-process credential theft. |
+| KN-015 | `net.ipv4.conf.default.accept_redirects` | 0 | `all` only covers interfaces that exist now; `default` covers ones created later (VPN, containers). |
+| KN-016 | `net.ipv4.conf.default.accept_source_route` | 0 | Same, for source routing. |
+| KN-017 | `net.ipv6.conf.default.accept_redirects` | 0 | Same, for IPv6 redirects. |
 
 ```bash
 sysctl net.ipv4.ip_forward kernel.randomize_va_space kernel.yama.ptrace_scope
 # fix (persistent):
-echo 'kernel.randomize_va_space = 2' | sudo tee -a /etc/sysctl.d/99-hardening.conf
+echo 'kernel.randomize_va_space = 2' | sudo tee -a /etc/sysctl.d/99-lab-hardening.conf
 sudo sysctl --system
 ```
 
@@ -826,7 +1872,7 @@ Checked for active state: `telnet`, `rsh`, `rlogin`, `vsftpd`,
 |---|---|---|
 | SV-* | Legacy/unneeded services disabled | telnet/rsh/rlogin are **cleartext**; SNMP often ships a default community string. |
 | NW-001 | Externally-bound listening sockets minimal | Each `0.0.0.0` listener is reachable. |
-| FW-001…004 | ufw / firewalld / nftables / iptables present with default deny | No host firewall means every listener is exposed. |
+| FW-001…004 | ufw / firewalld / nftables / iptables present with default deny | No host firewall means every listener is exposed. (ufw is matched on `Status: active` exactly; `inactive` is a FAIL.) |
 
 ```bash
 ss -lntu | grep -E '0\.0\.0\.0|\[::\]'
@@ -853,42 +1899,59 @@ sudo ufw status verbose          # or: firewall-cmd --list-all
 ```bash
 sudo auditctl -l
 getenforce            # or: sudo aa-status
-sudo apt-get -s upgrade | grep ^Inst
+sudo apt-get -s --with-new-pkgs upgrade | grep ^Inst
 ```
 
 ---
 
 ## Hardening profiles
 
-| Profile | Windows | Linux | Risk |
-|---|---|---|---|
-| **Baseline** | UAC, password/lockout policy, LSA anonymous restrictions, WDigest off, Defender core, firewall inbound block, LLMNR/NetBIOS off, SMB signing, AutoRun off, RDP NLA, PowerShell logging, audit policy, log sizes, low-value services off | sysctl set, SSH core settings, password aging, faillock, umask 027, core dumps off, legacy services off, firewall default-deny, auditd, persistent journal, banners | Low |
-| **Strict** | + LSASS PPL (`RunAsPPL`), 15 ASR rules, network protection, SMBv1 off, PowerShell v2 off, WSH off, TLS 1.0/1.1 off, Spooler/ICS/RRAS off | + keys-only SSH, no TCP forwarding, password complexity, `kptr_restrict`, `ptrace_scope`, audit rules, module blacklist, more services off | Medium |
-| **Paranoid** | + controlled folder access, WinRM off, RDP off | + umask 077, `/tmp noexec` guidance | High |
+| Profile | Windows | Linux | AD | Risk |
+|---|---|---|---|---|
+| **Baseline** | UAC, password/lockout policy, LSA anonymous restrictions, WDigest off, Defender core, firewall inbound block + logging, LLMNR/NetBIOS off, SMB signing, AutoRun off, RDP NLA, PowerShell logging, audit policy, log sizes, Remote Registry/SSDP/UPnP off | sysctl set (incl. `default.*`), SSH core settings, password aging, pwquality minlen, faillock, umask 027, core dumps off, avahi/cups/rpcbind/telnet off, firewall default-deny, auditd, persistent journal, file modes, banners | MachineAccountQuota 0, Recycle Bin, password policy, DAs not delegable, pre-auth on, no reversible encryption, LDAP signing, channel binding (when supported), DC Spooler off, NTLM audit, DC SMB signing, AD audit policy, 1 GB Security log | Low |
+| **Strict** | + LSASS PPL, 15 ASR rules, network protection, SMBv1 off, PowerShell v2 off, WSH off, TLS 1.0/1.1 off, no bridging, Spooler/ICS/RRAS off, File & Printer Sharing closed on Public | + keys-only SSH (guarded), no TCP forwarding, password complexity, `kptr_restrict`, `ptrace_scope`, audit rules, module blacklist, FTP/SNMP/NFS/Samba/xinetd off | + empty Operators groups, no unconstrained delegation, LSASS PPL, AES-only Kerberos, channel binding always | Medium |
+| **Paranoid** | + Controlled Folder Access, WinRM off, RDP off | + umask 077, `/tmp noexec` guidance | + deny all NTLM | High |
 
-> `Paranoid` disables remote management. Do not apply it to a VM you can only
+> `Paranoid` removes remote management. Don't apply it to a VM you can only
 > reach over the network.
 
 ---
 
 ## Rollback
 
-**Windows** — each run writes a JSON journal:
+**Windows.** Each run writes a JSON journal, saved **after every single
+change**, so it survives a crash, reboot, or host timeout part-way through:
 
 ```bash
 ./scripts/vmctl.sh run-elevated scripts/windows/Invoke-Hardening.ps1 \
   -RollbackFile 'C:\Windows\Temp\vmctl\rollback\rollback-<stamp>.json'
+./scripts/vmctl.sh run-elevated scripts/windows/Invoke-ADHardening.ps1 \
+  -RollbackFile 'C:\Windows\Temp\vmctl\rollback\ad-rollback-<stamp>.json'
 ```
 
-**Linux** — each run writes a directory of original files:
+**Linux.** Each run writes a directory with the original files, their
+modes, and a list of files it created:
 
 ```bash
-sudo ./harden.sh --rollback /var/backups/lab-harden/<stamp>
+sudo sh harden.sh --rollback /var/backups/lab-harden/<stamp>
+sudo sshd -t && sudo systemctl restart ssh   # or sshd
+sudo sysctl --system
 ```
 
-Registry values and config files revert automatically. **Service state,
-Windows optional features, and AD object changes are recorded but must be
-reverted manually** — they are listed in the journal output.
+What reverts automatically and what doesn't:
+
+| Change | Windows | AD | Linux |
+|---|---|---|---|
+| Registry values / config files | yes | yes | yes |
+| File permissions | - | - | yes |
+| Files the run created (drop-ins, sysctl, modprobe, audit rules) | - | - | yes, deleted |
+| Service start type + running state | yes | Spooler: yes | listed, manual |
+| Audit policy (`auditpol`) | yes (from a `/backup` CSV) | yes | - |
+| `ms-DS-MachineAccountQuota` | - | yes | - |
+| Firewall profile state | listed, manual | - | listed, manual |
+| Windows optional features (SMBv1, PSv2) | manual: `Enable-WindowsOptionalFeature` | - | - |
+| Other AD object changes | - | prior state printed for manual undo | - |
+| Live sysctl values | - | - | file restored; reboot to fully reset |
 
 The blunt fallback is always the snapshot:
 
@@ -898,41 +1961,93 @@ The blunt fallback is always the snapshot:
 
 ---
 
-## Safety
+## Safety rules
 
-- **Snapshot before every change.** Non-negotiable.
-- **Dry-run before every apply.** `-WhatIf` (Windows) / `--dry-run` (Linux).
-- **Patch before hardening** — hardening can disable services Windows Update
-  or `apt` depend on.
-- **Keep a second SSH session open** when hardening Linux.
-- **Snapshot every DC** before AD changes, apply to one, let replication
-  converge, then continue.
-- `.vmctl.env` holds a plaintext password. Use throwaway lab credentials.
+- **Snapshot before every change.** Non-negotiable. For AD, every DC.
+- **Dry-run before every apply.** `-WhatIf` (Windows) / `--dry-run` (Linux),
+  and actually read the output.
+- **Patch before hardening.**
+- **Keep a second SSH session open** when hardening Linux, and test a new
+  login before closing the old one.
+- **One profile at a time.** Re-audit between Baseline, Strict, and Paranoid.
+- **AD:** apply on one DC, let replication converge
+  (`repadmin /replsummary`), then continue.
+- `.vmctl.env` holds a plaintext password. Use throwaway lab credentials,
+  `chmod 600` it, and don't commit it (it's in `.gitignore`).
 - `Enable-AgentElevation.ps1` creates a **persistent local privilege
-  escalation path**. Remove it with `-Remove` when finished.
-- Never switch NAT→bridged to bypass a corporate TLS proxy. Install the
-  proxy's root CA in the guest instead.
+  escalation path**. Remove it with `-Remove` when you're finished.
+- Never switch NAT to bridged to get around a corporate TLS proxy. Install
+  the proxy's root CA in the guest instead.
+- AD CS findings (ESC1–ESC4) are reported but **never auto-remediated**.
+
+---
+
+## Troubleshooting quick reference
+
+Full list with verbatim error text: `reference/troubleshooting.md`.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Access is denied` writing HKLM from the host | UAC-filtered guest token | Elevation task ([2.3](#23-uac-token-filtering-why-administrator-is-not-elevated)) |
+| `run-elevated`: `elevation task ... not found` | bootstrap not run, or a different `ELEV_TASK` | run `Enable-AgentElevation.ps1` in the guest |
+| `run-elevated`: push failed / access denied on `C:\Windows\Temp\vmctl` | folder ACL doesn't include `GUEST_USER` | re-run `Enable-AgentElevation.ps1 -AgentUser <DOMAIN\user>` |
+| `run-elevated` times out during patching | Windows Update is slow | `ELEV_TIMEOUT=3600`; the task keeps running, so check `elevated.log` later |
+| `A positional parameter cannot be found that accepts argument ' '` | `-File` through `cmd /c` | use `-Command "& 'script'"` (vmctl does) |
+| vmrun exit 1, no output, Windows 11 ARM64 | launching `powershell.exe` directly | launch `cmd.exe /c powershell ...` (vmctl does) |
+| Garbled output (`ÿþ`, spaced letters) | UTF-16LE output read as UTF-8 | decode by BOM (`iconv -f UTF-16LE`) |
+| `vmrun stop soft` hangs | Tools not responding | `vmctl.sh stop 60` (enforces a deadline) |
+| Locked out of SSH after hardening | passwords off with no working key, or firewall port | console in through VMware, `harden.sh --rollback <dir>` |
+| `sshd -t`: `Missing privilege separation directory: /run/sshd` | sshd not running yet | `mkdir -p /run/sshd` (harden.sh does) |
+| `sudo: a password is required` in `lrun --sudo` | no passwordless sudo | see [2.4](#24-linux-privilege-sudo-without-a-terminal) |
+| apt upgrade hangs | conffile prompt with no TTY | `-o Dpkg::Options::=--force-confold` (patch.sh does) |
+| Audit says `Unknown` a lot | ran non-elevated / non-root | re-run elevated / with sudo |
+| `ERR_CERT_AUTHORITY_INVALID` in the guest | TLS-inspecting proxy | import the proxy root CA into the guest |
+
+---
+
+## Glossary
+
+| Term | Meaning |
+|---|---|
+| **ASR** | Attack Surface Reduction: Defender rules that block common malware behaviours (Office spawning processes, credential theft from LSASS, ...). |
+| **AS-REP roasting** | Requesting a Kerberos AS-REP for an account with pre-authentication disabled and cracking it offline. |
+| **CBT / channel binding** | Ties an LDAPS authentication to the TLS channel, so it can't be relayed. |
+| **CIS** | Center for Internet Security. Publishes the benchmarks these checks are aligned with. |
+| **DC** | Domain controller. |
+| **ESC1–ESC4** | Classes of AD Certificate Services misconfiguration that let a user obtain a certificate for someone else (e.g. a Domain Admin). |
+| **Kerberoasting** | Requesting service tickets for accounts with SPNs and cracking them offline. |
+| **LAPS** | Local Administrator Password Solution: unique, rotated local admin passwords stored in AD. |
+| **LLMNR / NBT-NS** | Fallback name-resolution protocols that tools like Responder spoof to capture hashes. |
+| **LSASS / PPL** | The process holding credentials in memory / Protected Process Light, which stops other processes reading it. |
+| **NLA** | Network Level Authentication: RDP authenticates before a session is created. |
+| **NTLM relay** | Forwarding a captured NTLM authentication to another service. Stopped by SMB/LDAP signing and channel binding. |
+| **RBCD** | Resource-Based Constrained Delegation. With a non-zero MachineAccountQuota, any user can create a computer account and abuse it. |
+| **Rollback journal** | The record of prior values a hardening run writes so its changes can be undone. |
+| **UAC token filtering** | Windows giving admin accounts a standard-rights token until elevation is approved. |
+| **Unconstrained delegation** | A computer that caches users' TGTs and can impersonate them anywhere. |
+| **VMware Tools / vmrun** | Guest agent / host CLI that together run programs and copy files in the guest without networking. |
+| **VMX** | The VM's configuration file on the host. |
 
 ---
 
 ## Testing status
 
-Verified against real systems, not just written:
-
 | Component | Verification |
 |---|---|
-| `linux/audit.sh` | Debian 12, Rocky 9, Alpine 3.20 — valid JSON, correct exit codes |
-| `linux/harden.sh` | Debian 12 — applied (score 50%→69%), `sshd -t` valid, rollback restored originals |
-| `linux/patch.sh` | Debian 12 (apt) and Rocky 9 (dnf) — scan and install, converges to 0 pending |
-| `vmctl.sh` vmrun transport | Live Windows 11 ARM64 VM |
-| `vmctl.sh` SSH transport | Dockerised sshd — `ssh`, `lpush`, `lpull`, `lrun`, `lrun --sudo` |
-| `Invoke-HardeningAudit.ps1` | Live VM — 61 checks, role detection |
-| `Invoke-ADAudit.ps1` | Live VM — graceful degradation on a non-domain host |
-| All PowerShell | Parsed with the PowerShell AST parser |
-| All shell | `sh -n` and bash 3.2 syntax check |
+| `linux/audit.sh` | Debian 12, Rocky 9, Alpine 3.20, Ubuntu 24.04 - valid JSON, correct exit codes |
+| `linux/harden.sh` | Debian 12 applied + rolled back. Ubuntu 24.04: strict apply with an `Include` + cloud-init drop-in (settings land in `00-lab-hardening.conf`), `Match`-block insertion, keys-only guard, and byte-identical rollback of files and modes |
+| `linux/patch.sh` | Debian 12 (apt), Rocky 9 (dnf), Ubuntu 24.04 (scan, JSON) |
+| `compare-audit.py` | Linux before/after reports; Windows-format keys and BOM handled |
+| `vmctl.sh` vmrun transport | live Windows 11 ARM64 VM |
+| `vmctl.sh` SSH transport | Dockerised sshd: `ssh`, `lpush`, `lpull`, `lrun`, `lrun --sudo` |
+| `Invoke-HardeningAudit.ps1` | live VM: 61 checks, role detection |
+| `Invoke-ADAudit.ps1` | live VM: graceful degradation on a non-domain host |
+| Elevated runner argument passing | PowerShell 7: named parameters, switches, quoted paths with spaces |
+| All PowerShell | parsed with the PowerShell AST parser |
+| All shell | `shellcheck -S warning` clean, `dash -n` |
 
-Not yet verified: `run-elevated` end-to-end (needs the one-time in-guest
-bootstrap), and the AD checks against a real domain controller — this lab
-has no DC. The AD logic follows documented Microsoft attributes and the
-standard ESC1–ESC4 definitions, but treat first use against a real domain
-as validation.
+Not yet verified: `run-elevated` end-to-end against a live guest after the
+runner and ACL changes, and the AD scripts against a real domain controller
+(this lab has no DC). The AD logic follows documented Microsoft attributes
+and the standard ESC1–ESC4 definitions, but treat first use against a real
+domain as validation, with snapshots.

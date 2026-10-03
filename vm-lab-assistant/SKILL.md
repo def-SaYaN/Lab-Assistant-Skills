@@ -82,7 +82,9 @@ Have the user run **once**, from an elevated PowerShell inside the guest:
 ```
 
 Then `run-elevated` works from the host. Remove it afterwards with
-`-Remove`.
+`-Remove`. If the user runs it from a different account than `GUEST_USER`,
+add `-AgentUser 'DOMAIN\user'` so the host account can write the control
+file.
 
 **Linux** — use `lrun --sudo`. Passwordless sudo or a configured askpass is
 required for non-interactive runs.
@@ -92,7 +94,7 @@ required for non-interactive runs.
 Hardening can disable services that the update path depends on.
 
 ```bash
-./scripts/vmctl.sh run-elevated scripts/windows/Invoke-Patching.ps1 -Install
+ELEV_TIMEOUT=3600 ./scripts/vmctl.sh run-elevated scripts/windows/Invoke-Patching.ps1 -Install
 ./scripts/vmctl.sh lrun --sudo scripts/linux/patch.sh --install
 ./scripts/vmctl.sh restart
 ```
@@ -124,8 +126,15 @@ Escalate one profile at a time, re-auditing between each.
 
 ### 6. Verify and clean up
 
-Re-audit, compare against the baseline, confirm no new failures, then remove
-the elevation task and rotate the bootstrap password.
+Re-audit, then diff against the baseline (exit 1 means something regressed):
+
+```bash
+./scripts/vmctl.sh compare baseline.json after.json
+```
+
+Confirm no regressions, then remove the elevation task and rotate the
+bootstrap password. `README.md` Part 4 has the by-hand version of every
+phase if the user wants to do or learn it manually.
 
 ## Rollback
 
@@ -140,8 +149,11 @@ Every hardening run writes a journal.
 ./scripts/vmctl.sh revert pre-hardening
 ```
 
-Registry values and config files revert automatically. Service state,
-Windows features, and AD object changes are recorded but need manual revert.
+Registry values, config files, Linux file modes, Windows service state, and
+audit policy revert automatically. Windows optional features, firewall
+profiles, and most AD object changes are recorded (prior state printed) but
+need manual revert. Journals are saved after every change, so they survive a
+mid-run crash or host timeout.
 
 ## Hard-won facts
 
@@ -179,6 +191,19 @@ These cost real debugging time. Trust them.
 15. **Use `vmxnet3`, not `e1000e`,** on Windows 11 ARM64.
 16. **Always run `sshd -t` before restarting sshd**, and keep a second
     session open.
+17. **sshd keeps the FIRST value it reads.** With `Include sshd_config.d/*.conf`
+    at the top, a cloud-init drop-in beats anything appended to
+    `sshd_config`; anything appended after a `Match` line only applies to
+    that match. `harden.sh` writes `sshd_config.d/00-lab-hardening.conf` and
+    checks the result with `sshd -T`.
+18. **Splatting a string array does not bind `-Name` parameters** in
+    PowerShell: `& $script @('-Profile','Strict')` binds `-Profile` as a
+    positional value. The elevated runner parses the argument line with the
+    PowerShell parser instead.
+19. **`ufw status` prints `Status: inactive`**, which contains "active".
+    Match `^Status: active`.
+20. **`ClientAliveCountMax 0` disables keepalive termination** on
+    OpenSSH 8.2+; use 3.
 
 ## Safety rules
 

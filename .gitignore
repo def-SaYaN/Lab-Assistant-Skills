@@ -1,0 +1,8 @@
+# macOS / editor noise
+.DS_Store
+__MACOSX/
+*.swp
+
+# Secrets and run output (never commit lab credentials)
+.vmctl.env
+*.log

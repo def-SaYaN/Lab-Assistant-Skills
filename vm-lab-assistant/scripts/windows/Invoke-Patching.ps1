@@ -20,7 +20,8 @@
     Update Defender signatures and skip Windows Update entirely.
 
 .PARAMETER IncludeOptional
-    Include updates not flagged as critical/important/security.
+    Also include non-software updates (drivers). By default the search is
+    limited to Type='Software'.
 
 .PARAMETER MaxUpdates
     Cap how many updates to install in one pass. Default 0 (no cap).

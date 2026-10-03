@@ -1,3 +1,5 @@
 .vmctl.env
 *.log
 *.json
+.DS_Store
+__pycache__/

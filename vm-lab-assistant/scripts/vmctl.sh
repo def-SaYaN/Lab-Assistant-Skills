@@ -138,6 +138,13 @@ GUEST_PASS=$([[ -n "$GUEST_PASS" ]] && echo '<set>' || echo '<unset>')
 GUEST_TMP=$GUEST_TMP
 GUEST_PS=$GUEST_PS
 ELEV_TASK=$ELEV_TASK
+ELEV_TIMEOUT=${ELEV_TIMEOUT:-900}
+SSH_HOST=${SSH_HOST:-<autodetect>}
+SSH_USER=$SSH_USER
+SSH_PORT=$SSH_PORT
+SSH_KEY=${SSH_KEY:-<none>}
+SUDO=$SUDO
+LINUX_TMP=$LINUX_TMP
 EOF
 }
 
@@ -232,6 +239,9 @@ cmd_ps() {
   local lf rf b64
   lf=$(_tmpf); rf="${GUEST_TMP}\\out.txt"
   cmd_mkdir-guest "$GUEST_TMP" >/dev/null 2>&1
+  # Remove the previous transfer file so a snippet that dies early cannot
+  # hand back a stale result from an earlier call.
+  _vmg deleteFileInGuest "$VMX" "$rf" >/dev/null 2>&1 || true
   # Base64 (UTF-16LE) avoids every quoting/escaping pitfall across the
   # host shell -> vmrun -> cmd -> powershell boundary.
   b64=$(printf '%s' "$code" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\n')
@@ -307,7 +317,7 @@ cmd_run-elevated() {
   probe=$(cmd_psout "if (Get-ScheduledTask -TaskName '${ELEV_TASK}' -EA SilentlyContinue) { 'present' } else { 'absent' }" 2>/dev/null | tr -d '[:space:]')
   if [[ "$probe" != "present" ]]; then
     _err "elevation task '${ELEV_TASK}' not found in guest."
-    _err "Run scripts/Enable-AgentElevation.ps1 once from an elevated PowerShell inside the VM."
+    _err "Run scripts/windows/Enable-AgentElevation.ps1 once from an elevated PowerShell inside the VM."
     return $E_GUEST
   fi
 
@@ -370,21 +380,21 @@ _ssh_autohost() {
 
 cmd_ssh() {
   _ssh_autohost || true
-  # shellcheck disable=SC2086
+  # shellcheck disable=SC2046,SC2086
   ssh -p "$SSH_PORT" $(_ssh_args) "$(_ssh_target)" "$@"
 }
 
 cmd_lpush() {
   local src="${1:?local source required}" dst="${2:?remote dest required}"
   _ssh_autohost || true
-  # shellcheck disable=SC2086
+  # shellcheck disable=SC2046,SC2086
   scp -P "$SSH_PORT" $(_ssh_args) "$src" "$(_ssh_target):$dst"
 }
 
 cmd_lpull() {
   local src="${1:?remote source required}" dst="${2:?local dest required}"
   _ssh_autohost || true
-  # shellcheck disable=SC2086
+  # shellcheck disable=SC2046,SC2086
   scp -P "$SSH_PORT" $(_ssh_args) "$(_ssh_target):$src" "$dst"
 }
 
@@ -399,14 +409,24 @@ cmd_lrun() {
 
   local base rp
   base=$(basename "$lp"); rp="${LINUX_TMP}/${base}"
-  # shellcheck disable=SC2086
+  # shellcheck disable=SC2046,SC2086
   ssh -p "$SSH_PORT" $(_ssh_args) "$(_ssh_target)" "mkdir -p '$LINUX_TMP'" >/dev/null 2>&1
   cmd_lpush "$lp" "$rp" >/dev/null || { _err "scp failed"; return $E_GUEST; }
 
   local pfx=""
   (( use_sudo )) && pfx="$SUDO "
-  # shellcheck disable=SC2086
-  ssh -p "$SSH_PORT" $(_ssh_args) "$(_ssh_target)" "chmod +x '$rp' && ${pfx}sh '$rp' $*"
+  # shellcheck disable=SC2046,SC2086
+  ssh -p "$SSH_PORT" $(_ssh_args) "$(_ssh_target)" "chmod +x '$rp' && ${pfx}sh '$rp'$(_shquote_args "$@")"
+}
+
+# Single-quote each argument for the remote shell so values containing
+# spaces or metacharacters arrive intact (e.g. --json '/tmp/my report.json').
+_shquote_args() {
+  local a q=""
+  for a in "$@"; do
+    q="$q '$(printf '%s' "$a" | sed "s/'/'\\\\''/g")'"
+  done
+  printf '%s' "$q"
 }
 
 # Detect guest OS family. Prefers VMware Tools, falls back to SSH.
@@ -418,9 +438,10 @@ cmd_detect() {
   fi
   local family="unknown"
   case "$(_upper "$os")" in
-    *WINDOWS*|*WIN*) family="windows" ;;
-    *UBUNTU*|*DEBIAN*|*CENTOS*|*RHEL*|*SUSE*|*LINUX*|*FEDORA*|*ORACLE*) family="linux" ;;
+    # DARWIN must precede *WIN*, which would otherwise swallow it.
     *DARWIN*) family="macos" ;;
+    *WINDOWS*|*WIN*) family="windows" ;;
+    *UBUNTU*|*DEBIAN*|*CENTOS*|*RHEL*|*SUSE*|*SLES*|*LINUX*|*FEDORA*|*ORACLE*|*ROCKY*|*ALMA*) family="linux" ;;
   esac
   printf 'vmx.guestOS=%s\nfamily=%s\n' "${os:-unknown}" "$family"
 
@@ -436,7 +457,7 @@ cmd_detect() {
   elif [[ "$family" == "linux" ]]; then
     printf 'hint=use scripts/linux/*.sh via lrun (set SSH_HOST/SSH_USER)\n'
     if _ssh_autohost 2>/dev/null; then
-      # shellcheck disable=SC2086
+      # shellcheck disable=SC2046,SC2086
       ssh -p "$SSH_PORT" $(_ssh_args) "$(_ssh_target)" \
         '. /etc/os-release 2>/dev/null; echo "guest=${PRETTY_NAME:-unknown}"' 2>/dev/null || true
     fi
@@ -460,8 +481,8 @@ cmd_audit-host() {
 
   local fw sb tpm enc iso1 iso2 shared dnd cp hgfs c3d
   fw=$(_get 'firmware');              sb=$(_get 'uefi.secureBoot.enabled')
-  tpm=$(printf '%s\n' "$v" | grep -ciE '^\s*vtpm\.present\s*=\s*"TRUE"')
-  enc=$(printf '%s\n' "$v" | grep -ciE '^\s*encryption\.')
+  tpm=$(printf '%s\n' "$v" | grep -ciE '^[[:space:]]*vtpm\.present[[:space:]]*=[[:space:]]*"TRUE"')
+  enc=$(printf '%s\n' "$v" | grep -ciE '^[[:space:]]*encryption\.')
   iso1=$(_get 'sata0:0.startConnected'); iso2=$(_get 'sata1:0.startConnected')
   shared=$(_get 'sharedFolder0.present'); dnd=$(_get 'isolation.tools.dnd.disable')
   cp=$(_get 'isolation.tools.copy.disable'); hgfs=$(_get 'isolation.tools.hgfsServerSet.disable')
@@ -489,6 +510,15 @@ cmd_audit-host() {
   [[ "$(_upper "$dnd")" == "TRUE" ]] || echo "  - Drag-and-drop is enabled (host<->guest data path)."
   [[ "$(_upper "$cp")"  == "TRUE" ]] || echo "  - Copy/paste is enabled (host<->guest data path)."
   return $E_OK
+}
+
+# Diff two audit JSON reports (baseline vs. after). Works for Linux, Windows,
+# and AD audit output. Exit 1 when any check regressed.
+cmd_compare() {
+  local before="${1:?baseline json required}" after="${2:?after json required}"; shift 2
+  local py
+  py=$(command -v python3 || command -v python) || { _err "python3 required for compare"; return $E_CONFIG; }
+  "$py" "$(dirname "${BASH_SOURCE[0]}")/compare-audit.py" "$before" "$after" "$@"
 }
 
 # ------------------------------------------------------------------ help ----
@@ -541,6 +571,8 @@ LINUX GUESTS (SSH transport; set SSH_HOST/SSH_USER or let it autodetect)
 
 AUDIT
   audit-host                  inspect .vmx virtualisation-layer posture
+  compare <before.json> <after.json> [--all]
+                              diff two audit reports; exit 1 on regressions
 
 EXIT CODES
   0 ok | 2 usage | 3 config | 4 vmrun | 5 guest | 6 timeout
@@ -554,7 +586,7 @@ main() {
   case "$cmd" in
     env|status|start|stop|restart|wait-tools|snapshot|snapshots|revert|\
     delete-snapshot|push|pull|exists|mkdir-guest|ps|psout|run-script|\
-    run-elevated|ps-list|whoami|audit-host|help|\
+    run-elevated|ps-list|whoami|audit-host|compare|help|\
     ssh|lpush|lpull|lrun|detect)
       "cmd_${cmd}" "$@" ;;
     -h|--help) cmd_help ;;

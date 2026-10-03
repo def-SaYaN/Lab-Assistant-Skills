@@ -19,7 +19,6 @@ set -u
 MODE="scan"
 SECURITY_ONLY=0
 REBOOT_IF_NEEDED=0
-ASSUME_YES=1
 JSON_OUT=""
 
 while [ $# -gt 0 ]; do
@@ -63,14 +62,31 @@ PENDING=0
 INSTALLED=0
 RC=0
 
+# Run a command, keep its real exit status, show only the tail of output.
+# (POSIX sh has no pipefail: `cmd | tail` would report tail's status and
+# hide every failed install.)
+LOG=$(mktemp "${TMPDIR:-/tmp}/labpatch.XXXXXX") || { echo "mktemp failed" >&2; exit 2; }
+trap 'rm -f "$LOG" "${SECLIST:-}"' EXIT INT TERM
+run_logged() {
+  "$@" > "$LOG" 2>&1
+  _rc=$?
+  tail -20 "$LOG"
+  return $_rc
+}
+
 case "$PKG" in
 
   apt)
     export DEBIAN_FRONTEND=noninteractive
+    # Keep local config files on conffile prompts; without this an upgrade
+    # that touches a modified config can hang waiting for a TTY answer.
+    APT_OPTS="-y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
     echo "Refreshing package index..."
     apt-get update -qq >/dev/null 2>&1 || echo "  (index refresh had warnings)"
 
-    LIST=$(apt-get -s upgrade 2>/dev/null | grep '^Inst ')
+    # --with-new-pkgs: plain `upgrade` keeps back anything that needs a new
+    # dependency - notably new kernel packages - and would never report them.
+    LIST=$(apt-get -s --with-new-pkgs upgrade 2>/dev/null | grep '^Inst ')
     PENDING=$(printf '%s' "$LIST" | grep -c '^Inst ' 2>/dev/null | head -1)
     PENDING=${PENDING:-0}
     SEC=$(printf '%s' "$LIST" | grep -ci security 2>/dev/null | head -1)
@@ -85,22 +101,29 @@ case "$PKG" in
     if [ "$MODE" = "install" ] && [ "$PENDING" -gt 0 ]; then
       echo ""
       echo "Installing..."
-      if [ "$SECURITY_ONLY" = "1" ]; then
-        # Build a security-only source list, then upgrade against it.
-        grep -rhE '^deb .*security' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null \
-          > /tmp/sec.list 2>/dev/null
-        if [ -s /tmp/sec.list ]; then
-          apt-get -o Dir::Etc::SourceList=/tmp/sec.list -o Dir::Etc::SourceParts=/dev/null \
-                  -y -qq upgrade 2>&1 | tail -20
+      if [ "$SECURITY_ONLY" = "1" ] && command -v unattended-upgrade >/dev/null 2>&1; then
+        # unattended-upgrades already knows the distro's security origins,
+        # including deb822 (.sources) layouts used by Ubuntu 24.04+.
+        run_logged unattended-upgrade -v; RC=$?
+      elif [ "$SECURITY_ONLY" = "1" ]; then
+        # Build a security-only one-line source list, then upgrade against it.
+        # mktemp, never a fixed /tmp name: this runs as root.
+        SECLIST=$(mktemp "${TMPDIR:-/tmp}/labsec.XXXXXX")
+        grep -rhE '^deb .*security' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null > "$SECLIST"
+        if [ -s "$SECLIST" ]; then
+          # shellcheck disable=SC2086
+          run_logged apt-get -o Dir::Etc::SourceList="$SECLIST" -o Dir::Etc::SourceParts=/dev/null \
+                  $APT_OPTS --with-new-pkgs upgrade; RC=$?
         else
-          echo "  no security sources found; falling back to full upgrade"
-          apt-get -y -qq upgrade 2>&1 | tail -20
+          echo "  no one-line security sources found (deb822 .sources layout?);"
+          echo "  install unattended-upgrades for security-only. Falling back to full upgrade."
+          # shellcheck disable=SC2086
+          run_logged apt-get $APT_OPTS --with-new-pkgs upgrade; RC=$?
         fi
-        rm -f /tmp/sec.list
       else
-        apt-get -y -qq upgrade 2>&1 | tail -20
+        # shellcheck disable=SC2086
+        run_logged apt-get $APT_OPTS --with-new-pkgs upgrade; RC=$?
       fi
-      RC=$?
       INSTALLED=$((PENDING))
       apt-get -y -qq autoremove >/dev/null 2>&1
     fi
@@ -109,9 +132,11 @@ case "$PKG" in
   dnf|yum)
     echo "Checking for updates..."
     if [ "$SECURITY_ONLY" = "1" ]; then
-      LIST=$($PKG -q --security check-update 2>/dev/null | grep -E '^[a-zA-Z0-9]')
+      LIST=$($PKG -q --security check-update 2>/dev/null | awk 'NF>=3 && $1 ~ /\./')
     else
-      LIST=$($PKG -q check-update 2>/dev/null | grep -E '^[a-zA-Z0-9]')
+      # Package lines only (name.arch version repo); skips headers such as
+      # "Obsoleting Packages".
+      LIST=$($PKG -q check-update 2>/dev/null | awk 'NF>=3 && $1 ~ /\./')
     fi
     PENDING=$(printf '%s' "$LIST" | grep -c . 2>/dev/null | head -1)
     PENDING=${PENDING:-0}
@@ -123,11 +148,10 @@ case "$PKG" in
       echo ""
       echo "Installing..."
       if [ "$SECURITY_ONLY" = "1" ]; then
-        $PKG -y --security upgrade 2>&1 | tail -20
+        run_logged "$PKG" -y --security upgrade; RC=$?
       else
-        $PKG -y upgrade 2>&1 | tail -20
+        run_logged "$PKG" -y upgrade; RC=$?
       fi
-      RC=$?
       INSTALLED=$PENDING
     fi
     ;;
@@ -140,11 +164,13 @@ case "$PKG" in
     echo "Pending : $PENDING"
     if [ "$MODE" = "install" ] && [ "$PENDING" -gt 0 ]; then
       if [ "$SECURITY_ONLY" = "1" ]; then
-        zypper --non-interactive patch --category security 2>&1 | tail -20
+        run_logged zypper --non-interactive patch --category security; RC=$?
       else
-        zypper --non-interactive update 2>&1 | tail -20
+        run_logged zypper --non-interactive update; RC=$?
       fi
-      RC=$?; INSTALLED=$PENDING
+      # zypper: 100-103 are informational (reboot/restart needed), not failure
+      case "$RC" in 100|101|102|103) RC=0 ;; esac
+      INSTALLED=$PENDING
     fi
     ;;
 
@@ -156,7 +182,7 @@ case "$PKG" in
     echo "Pending : $PENDING"
     [ "$PENDING" -gt 0 ] && printf '%s\n' "$LIST" | head -40
     if [ "$MODE" = "install" ] && [ "$PENDING" -gt 0 ]; then
-      apk upgrade 2>&1 | tail -20; RC=$?; INSTALLED=$PENDING
+      run_logged apk upgrade; RC=$?; INSTALLED=$PENDING
     fi
     ;;
 
@@ -168,7 +194,7 @@ case "$PKG" in
     echo "Pending : $PENDING"
     [ "$PENDING" -gt 0 ] && printf '%s\n' "$LIST" | head -40
     if [ "$MODE" = "install" ] && [ "$PENDING" -gt 0 ]; then
-      pacman -Su --noconfirm 2>&1 | tail -20; RC=$?; INSTALLED=$PENDING
+      run_logged pacman -Su --noconfirm; RC=$?; INSTALLED=$PENDING
     fi
     ;;
 esac
@@ -185,10 +211,17 @@ else
   # Compare running kernel against the newest installed kernel.
   RUNNING=$(uname -r)
   NEWEST=""
-  if [ -d /boot ]; then
-    NEWEST=$(ls -1 /boot 2>/dev/null | grep -E '^vmlinuz-' | sed 's/^vmlinuz-//' | sort -V | tail -1)
-  fi
-  if [ -n "$NEWEST" ] && [ "$NEWEST" != "$RUNNING" ]; then
+  for _k in /boot/vmlinuz-*; do
+    [ -e "$_k" ] || continue
+    _v=${_k#/boot/vmlinuz-}
+    # Only versioned images: Arch names its image vmlinuz-linux, and RHEL
+    # ships a vmlinuz-0-rescue-* that is never "newer".
+    case "$_v" in [1-9]*) NEWEST=$(printf '%s\n%s\n' "$NEWEST" "$_v" | sort -V | tail -1) ;; esac
+  done
+  if [ ! -d "/lib/modules/$RUNNING" ]; then
+    # Running kernel's modules were removed by an upgrade (Arch, Alpine).
+    REBOOT=1; REBOOT_WHY="modules for running kernel $RUNNING are gone"
+  elif [ -n "$NEWEST" ] && [ "$NEWEST" != "$RUNNING" ]; then
     REBOOT=1; REBOOT_WHY="running $RUNNING, installed $NEWEST"
   fi
 fi
