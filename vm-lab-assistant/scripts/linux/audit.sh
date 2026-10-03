@@ -99,9 +99,18 @@ sshd_effective() {
 
 sshd_config_grep() {
   [ -r /etc/ssh/sshd_config ] || return 1
-  # last uncommented occurrence wins in our approximation
-  grep -riE "^[[:space:]]*$1[[:space:]]+" /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null \
-    | tail -1 | awk '{print $2}'
+  # sshd keeps the FIRST value it reads. The usual layout is an Include of
+  # sshd_config.d/*.conf at the top, so drop-ins are read before the rest.
+  # (Approximation: ignores Match blocks; sshd -T is authoritative.)
+  _files="/etc/ssh/sshd_config"
+  if grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config 2>/dev/null; then
+    _files="$(ls /etc/ssh/sshd_config.d/*.conf 2>/dev/null | sort | tr '\n' ' ') /etc/ssh/sshd_config"
+  fi
+  # shellcheck disable=SC2086
+  awk -v k="$(printf '%s' "$1" | tr 'A-Z' 'a-z')" '
+    FNR==1 { inmatch=0 }
+    tolower($1)=="match" { inmatch=1 }
+    !inmatch && tolower($1)==k { print $2; exit }' $_files 2>/dev/null
 }
 
 sshd_get() {
@@ -297,7 +306,7 @@ if [ -r /etc/ssh/sshd_config ] || command -v sshd >/dev/null 2>&1; then
   add "SSH-006" "SSH" "Idle session timeout configured" \
       "$([ -n "$v" ] && [ "$v" -gt 0 ] && [ "$v" -le 900 ] 2>/dev/null && echo PASS || echo WARN)" \
       "${v:-unset}" "1-900 seconds" "Low" \
-      "Set 'ClientAliveInterval 300' and 'ClientAliveCountMax 0'"
+      "Set 'ClientAliveInterval 300' and 'ClientAliveCountMax 3'"
 
   v=$(sshd_get logingracetime || echo "")
   add "SSH-007" "SSH" "LoginGraceTime <= 60" \
@@ -378,6 +387,12 @@ sysctl_check "KN-013" "net.ipv6.conf.all.accept_redirects" "0" "Medium" \
   "IPv6 equivalent of KN-002."
 sysctl_check "KN-014" "kernel.yama.ptrace_scope" "1" "Medium" \
   "Restricts ptrace to descendants; blocks cross-process credential theft."
+sysctl_check "KN-015" "net.ipv4.conf.default.accept_redirects" "0" "Medium" \
+  "'all' only covers existing interfaces; 'default' covers ones created later."
+sysctl_check "KN-016" "net.ipv4.conf.default.accept_source_route" "0" "Medium" \
+  "Source routing on interfaces created after boot."
+sysctl_check "KN-017" "net.ipv6.conf.default.accept_redirects" "0" "Medium" \
+  "IPv6 redirects on interfaces created after boot."
 
 # ======================================================= 5. FILESYSTEM ======
 
@@ -454,7 +469,7 @@ else
 fi
 
 # Core dumps
-cl=$(grep -rhE '^\s*\*\s+hard\s+core' /etc/security/limits.conf /etc/security/limits.d/ 2>/dev/null | head -1)
+cl=$(grep -rhE '^[[:space:]]*\*[[:space:]]+hard[[:space:]]+core' /etc/security/limits.conf /etc/security/limits.d/ 2>/dev/null | head -1)
 add "FS-009" "Filesystem" "Core dumps disabled" \
     "$([ -n "$cl" ] && echo PASS || echo WARN)" \
     "${cl:-not configured}" "* hard core 0" "Low" \
@@ -518,7 +533,7 @@ if command -v ufw >/dev/null 2>&1; then
   fw_found=1
   st=$(ufw status 2>/dev/null | head -1)
   add "FW-001" "Firewall" "ufw enabled with default deny incoming" \
-      "$(printf '%s' "$st" | grep -qi 'active' && echo PASS || echo FAIL)" \
+      "$(printf '%s' "$st" | grep -qiE '^status:[[:space:]]*active' && echo PASS || echo FAIL)" \
       "${st:-unknown}" "Status: active" "High" \
       "ufw default deny incoming; ufw allow 22/tcp; ufw --force enable"
 fi
@@ -580,7 +595,7 @@ else
 fi
 
 # Remote log shipping
-rem=$(grep -rhE '^\s*\*\.\*\s+@|^\s*action\(type="omfwd"' /etc/rsyslog.conf /etc/rsyslog.d/ 2>/dev/null | head -1)
+rem=$(grep -rhE '^[[:space:]]*\*\.\*[[:space:]]+@|^[[:space:]]*action\(type="omfwd"' /etc/rsyslog.conf /etc/rsyslog.d/ 2>/dev/null | head -1)
 add "LG-005" "Logging" "Logs forwarded to a remote collector" \
     "$([ -n "$rem" ] && echo PASS || echo WARN)" \
     "${rem:-not configured}" "remote target" "Medium" \
@@ -634,7 +649,7 @@ case "$PKG" in
     ;;
   dnf|yum)
     if [ "$IS_ROOT" = "1" ]; then
-      n=$(num "$($PKG -q check-update 2>/dev/null | grep -cE '^[a-zA-Z0-9]')")
+      n=$(num "$($PKG -q check-update 2>/dev/null | awk 'NF>=3 && $1 ~ /\./' | grep -c .)")
       add "PA-001" "Patching" "No pending package updates" \
           "$([ "${n:-0}" -eq 0 ] && echo PASS || echo FAIL)" \
           "$n pending" "0" "Medium" "$PKG update"
@@ -675,7 +690,7 @@ if [ -r /boot/grub/grub.cfg ] || [ -r /boot/grub2/grub.cfg ]; then
       "$(case "$m" in 600|400) echo PASS ;; *) echo WARN ;; esac)" \
       "$m" "600" "Medium" "chmod 600 $gc"
 
-  if grep -qE '^\s*(set superusers|password_pbkdf2)' "$gc" 2>/dev/null; then
+  if grep -qE '^[[:space:]]*(set superusers|password_pbkdf2)' "$gc" 2>/dev/null; then
     add "BT-002" "Boot" "GRUB password set" "PASS" "configured" "configured" "Medium" ""
   else
     add "BT-002" "Boot" "GRUB password set" "WARN" "not set" "configured" "Medium" \
@@ -762,7 +777,7 @@ if [ -n "$JSON_OUT" ]; then
       [ -z "$id" ] && continue
       [ "$first" = "0" ] && printf ',\n'
       first=0
-      esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+      esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\t\r' '  '; }
       printf '    {"id":"%s","category":"%s","title":"%s","status":"%s","observed":"%s","expected":"%s","severity":"%s","fixHint":"%s"}' \
         "$(esc "$id")" "$(esc "$cat")" "$(esc "$title")" "$(esc "$status")" \
         "$(esc "$obs")" "$(esc "$exp")" "$(esc "$sev")" "$(esc "$fix")"

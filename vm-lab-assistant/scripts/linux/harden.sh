@@ -11,6 +11,9 @@
 #   ./harden.sh --profile baseline         apply
 #   ./harden.sh --profile strict
 #   ./harden.sh --rollback /var/backups/lab-harden/<stamp>
+#   ./harden.sh --profile strict --only HD-SSH-011,HD-FW-001
+#   ./harden.sh --profile strict --yes     allow keys-only SSH even when no
+#                                          authorized_keys file is found
 #
 # Profiles:
 #   baseline  safe, reversible, low breakage risk
@@ -37,7 +40,7 @@ while [ $# -gt 0 ]; do
     --only)     ONLY="${2:-}"; shift 2 ;;
     --skip)     SKIP="${2:-}"; shift 2 ;;
     --yes|-y)   ASSUME_YES=1; shift ;;
-    -h|--help)  sed -n '2,22p' "$0"; exit 0 ;;
+    -h|--help)  sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -49,7 +52,7 @@ esac
 
 [ "$(id -u)" = "0" ] || { echo "harden.sh must run as root." >&2; exit 3; }
 
-APPLIED=0; FAILED=0; SKIPPED=0; NOOP=0
+APPLIED=0; FAILED=0; SKIPPED=0; NOOP=0; WOULD=0
 
 # ------------------------------------------------------------- rollback ----
 
@@ -71,13 +74,22 @@ if [ -n "$ROLLBACK" ]; then
       rm -f "$f" 2>/dev/null && echo "  [rev] removed $f"
     done < "$ROLLBACK/removed-files.txt"
   fi
-  if [ -f "$ROLLBACK/services.txt" ]; then
+  if [ -f "$ROLLBACK/perms.txt" ]; then
+    # perms lines: mode<TAB>path
+    while IFS="$(printf '\t')" read -r mode path; do
+      [ -z "${path:-}" ] && continue
+      chmod "$mode" "$path" 2>/dev/null && echo "  [rev] chmod $mode $path"
+    done < "$ROLLBACK/perms.txt"
+  fi
+  if [ -f "$ROLLBACK/services.txt" ] && [ -s "$ROLLBACK/services.txt" ]; then
     echo ""
     echo "Service changes must be reverted manually:"
     cat "$ROLLBACK/services.txt"
   fi
   echo ""
-  echo "Rollback complete. Reload affected daemons (e.g. systemctl restart sshd)."
+  echo "Rollback complete. Reload affected daemons and settings:"
+  echo "  sshd -t && systemctl restart sshd   (ssh on Debian/Ubuntu)"
+  echo "  sysctl --system"
   exit 0
 fi
 
@@ -91,6 +103,7 @@ if [ "$DRY" = "0" ]; then
   : > "$JDIR/manifest.txt"
   : > "$JDIR/removed-files.txt"
   : > "$JDIR/services.txt"
+  : > "$JDIR/perms.txt"
 fi
 
 # Back up a file ONCE per run. Controls call this repeatedly for the same
@@ -132,7 +145,7 @@ selected() {
   return 0
 }
 
-say_would() { printf '  [would] %-12s %s\n' "$1" "$2"; }
+say_would() { printf '  [would] %-12s %s\n' "$1" "$2"; WOULD=$((WOULD+1)); }
 say_set()   { printf '  [set]   %-12s %s\n' "$1" "$2"; APPLIED=$((APPLIED+1)); }
 say_ok()    { printf '  [ok]    %-12s %s\n' "$1" "$2"; NOOP=$((NOOP+1)); }
 say_fail()  { printf '  [FAIL]  %-12s %s\n' "$1" "$2"; FAILED=$((FAILED+1)); }
@@ -140,6 +153,11 @@ say_fail()  { printf '  [FAIL]  %-12s %s\n' "$1" "$2"; FAILED=$((FAILED+1)); }
 # Set a key=value in a config file (append or replace), idempotently.
 set_kv() {
   _id="$1"; _file="$2"; _key="$3"; _val="$4"; _sep="${5:- }"; _desc="$6"
+
+  # Remember what sshd should end up with, for the sshd -T check later.
+  if [ "$_file" = "${SSHD:-}" ]; then
+    SSHD_EXPECT="$SSHD_EXPECT $(printf '%s:%s' "$_key" "$_val" | tr 'A-Z' 'a-z')"
+  fi
 
   _cur=""
   if [ -f "$_file" ]; then
@@ -164,6 +182,13 @@ set_kv() {
     _tmp="${_file}.labtmp.$$"
     sed -E "s,^[[:space:]]*#?[[:space:]]*(${_key})([[:space:]]|=).*,${_key}${_sep}${_val}," \
         "$_file" > "$_tmp" 2>/dev/null && cat "$_tmp" > "$_file" && rm -f "$_tmp"
+  elif grep -qiE '^[[:space:]]*Match[[:space:]]' "$_file" 2>/dev/null; then
+    # sshd_config: anything after the first Match line belongs to that Match
+    # block, so a global setting must be inserted ABOVE it, not appended.
+    _tmp="${_file}.labtmp.$$"
+    awk -v line="${_key}${_sep}${_val}" '
+      !done && tolower($0) ~ /^[[:space:]]*match[[:space:]]/ { print line; done=1 }
+      { print }' "$_file" > "$_tmp" 2>/dev/null && cat "$_tmp" > "$_file" && rm -f "$_tmp"
   else
     printf '%s%s%s\n' "$_key" "$_sep" "$_val" >> "$_file"
   fi
@@ -199,7 +224,7 @@ sysctl_set() {
 
   if [ "$DRY" = "1" ]; then say_would "$_id" "$_key: ${_cur:-?} -> $_val ($_desc)"; return 0; fi
 
-  [ -f "$SYSCTL_FILE" ] || backup_file "$SYSCTL_FILE"
+  backup_file "$SYSCTL_FILE"
   # Remove any previous line for this key in our file, then append.
   if [ -f "$SYSCTL_FILE" ] && grep -q "^${_key}[[:space:]]*=" "$SYSCTL_FILE" 2>/dev/null; then
     _t="${SYSCTL_FILE}.tmp.$$"
@@ -229,14 +254,39 @@ sysctl_set "HD-KN-011" "kernel.dmesg_restrict"                  "1" "restrict dm
 sysctl_set "HD-KN-012" "kernel.kptr_restrict"                   "2" "hide kptrs" strict paranoid
 sysctl_set "HD-KN-013" "net.ipv6.conf.all.accept_redirects"     "0" "no v6 redirect" baseline strict paranoid
 sysctl_set "HD-KN-014" "kernel.yama.ptrace_scope"               "1" "restrict ptrace" strict paranoid
+# "all" only covers existing interfaces; "default" covers ones created later.
+sysctl_set "HD-KN-015" "net.ipv4.conf.default.accept_redirects" "0" "no ICMP redirect (new ifaces)" baseline strict paranoid
+sysctl_set "HD-KN-016" "net.ipv4.conf.default.accept_source_route" "0" "no source route (new ifaces)" baseline strict paranoid
+sysctl_set "HD-KN-017" "net.ipv6.conf.default.accept_redirects" "0" "no v6 redirect (new ifaces)" baseline strict paranoid
 
 # =============================================================== 2. SSH ====
 
 echo ""
 echo "--- SSH daemon ---"
-SSHD=/etc/ssh/sshd_config
+SSHD_MAIN=/etc/ssh/sshd_config
+SSHD="$SSHD_MAIN"
+SSHD_EXPECT=""
 
-if [ -f "$SSHD" ]; then
+# sshd uses the FIRST value it sees for a keyword. Modern distros put
+# "Include /etc/ssh/sshd_config.d/*.conf" at the top of sshd_config, so a
+# drop-in such as 50-cloud-init.conf (PasswordAuthentication yes) beats
+# anything we write further down. When that Include exists, write our
+# settings to a drop-in that sorts first instead; rollback then just
+# deletes it.
+if [ -f "$SSHD_MAIN" ] && \
+   grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' "$SSHD_MAIN" 2>/dev/null; then
+  SSHD=/etc/ssh/sshd_config.d/00-lab-hardening.conf
+  echo "  (sshd_config includes sshd_config.d; writing settings to $SSHD)"
+fi
+
+# Users who could still log in with a key once passwords are turned off.
+ssh_key_users() {
+  for _h in /root /home/*; do
+    [ -s "$_h/.ssh/authorized_keys" ] && printf '%s ' "$(basename "$_h")"
+  done
+}
+
+if [ -f "$SSHD_MAIN" ]; then
   selected "HD-SSH-001" baseline strict paranoid && \
     set_kv "HD-SSH-001" "$SSHD" "PermitRootLogin" "no" " " "Disable direct root SSH login"
   selected "HD-SSH-002" baseline strict paranoid && \
@@ -251,14 +301,26 @@ if [ -f "$SSHD" ]; then
     set_kv "HD-SSH-006" "$SSHD" "HostbasedAuthentication" "no" " " "Disable host-based auth"
   selected "HD-SSH-007" baseline strict paranoid && \
     set_kv "HD-SSH-007" "$SSHD" "ClientAliveInterval" "300" " " "Idle timeout 300s"
+  # NOTE: 0 does NOT mean "disconnect immediately" on OpenSSH >= 8.2 - it
+  # disables keepalive-based termination entirely. 3 drops dead clients
+  # after 3 unanswered keepalives (CIS current guidance).
   selected "HD-SSH-008" baseline strict paranoid && \
-    set_kv "HD-SSH-008" "$SSHD" "ClientAliveCountMax" "0" " " "Disconnect after first idle timeout"
+    set_kv "HD-SSH-008" "$SSHD" "ClientAliveCountMax" "3" " " "Drop unresponsive clients after 3 missed keepalives"
   selected "HD-SSH-009" baseline strict paranoid && \
     set_kv "HD-SSH-009" "$SSHD" "LoginGraceTime" "60" " " "Auth must complete in 60s"
   selected "HD-SSH-010" baseline strict paranoid && \
     set_kv "HD-SSH-010" "$SSHD" "PermitUserEnvironment" "no" " " "Block user env injection"
-  selected "HD-SSH-011" strict paranoid && \
-    set_kv "HD-SSH-011" "$SSHD" "PasswordAuthentication" "no" " " "Keys only (ENSURE A KEY WORKS FIRST)"
+  if selected "HD-SSH-011" strict paranoid; then
+    _ku=$(ssh_key_users)
+    if [ -z "$_ku" ] && [ "$ASSUME_YES" = "0" ]; then
+      # Turning off passwords with no authorized_keys anywhere locks
+      # everyone out at the next sshd restart.
+      say_fail "HD-SSH-011" "refusing PasswordAuthentication no: no authorized_keys found (override with --yes)"
+    else
+      set_kv "HD-SSH-011" "$SSHD" "PasswordAuthentication" "no" " " \
+        "Keys only (key users: ${_ku:-none - forced by --yes})"
+    fi
+  fi
   selected "HD-SSH-012" strict paranoid && \
     set_kv "HD-SSH-012" "$SSHD" "AllowTcpForwarding" "no" " " "Block SSH tunnelling"
   selected "HD-SSH-013" baseline strict paranoid && \
@@ -266,8 +328,25 @@ if [ -f "$SSHD" ]; then
 
   # Validate before anyone restarts sshd with a broken config.
   if [ "$DRY" = "0" ] && command -v sshd >/dev/null 2>&1; then
+    # Debian's sshd -t refuses to run without its privilege-separation dir.
+    [ -d /run/sshd ] || mkdir -p /run/sshd 2>/dev/null
     if sshd -t 2>/dev/null; then
       echo "  [ok]    sshd-check   configuration syntax valid"
+      # Confirm the EFFECTIVE values (sshd -T) - catches settings shadowed
+      # by an earlier Include or by a Match block.
+      _eff=$(sshd -T 2>/dev/null)
+      if [ -n "$_eff" ]; then
+        _shadow=""
+        for _kv in $SSHD_EXPECT; do
+          _k=${_kv%%:*}; _v=${_kv#*:}
+          _got=$(printf '%s\n' "$_eff" | awk -v k="$_k" '$1==k {print tolower($2); exit}')
+          [ -n "$_got" ] && [ "$_got" != "$_v" ] && _shadow="$_shadow $_k=$_got"
+        done
+        if [ -n "$_shadow" ]; then
+          echo "  [FAIL]  sshd-check   effective config still has:$_shadow (overridden elsewhere?)"
+          FAILED=$((FAILED+1))
+        fi
+      fi
     else
       echo "  [FAIL]  sshd-check   sshd -t FAILED - DO NOT restart sshd; restore from $JDIR"
       FAILED=$((FAILED+1))
@@ -289,7 +368,7 @@ if [ -f "$LD" ]; then
     set_kv "HD-ID-002" "$LD" "PASS_MIN_DAYS" "1"   "	" "Password min age 1 day"
   selected "HD-ID-003" baseline strict paranoid && \
     set_kv "HD-ID-003" "$LD" "PASS_WARN_AGE" "7"   "	" "Warn 7 days before expiry"
-  selected "HD-ID-004" baseline strict paranoid && \
+  selected "HD-ID-004" baseline strict && \
     set_kv "HD-ID-004" "$LD" "UMASK"         "027" "	" "Default umask 027"
   selected "HD-ID-005" paranoid && \
     set_kv "HD-ID-005" "$LD" "UMASK"         "077" "	" "Default umask 077 (paranoid)"
@@ -342,7 +421,8 @@ disable_svc() {
   selected "$_id" "$@" || return 0
   [ "$HAS_SYSTEMD" = "1" ] || { say_ok "$_id" "$_svc (no systemd)"; return 0; }
 
-  if ! systemctl list-unit-files 2>/dev/null | grep -q "^${_svc}"; then
+  # Exact unit match: a bare prefix would treat cups-browsed as cups.
+  if ! systemctl list-unit-files 2>/dev/null | grep -qE "^${_svc}(\.service)?[[:space:]]"; then
     say_ok "$_id" "$_svc not installed"; return 0
   fi
   if ! systemctl is-active --quiet "$_svc" 2>/dev/null && \
@@ -373,19 +453,24 @@ disable_svc "HD-SV-009" "xinetd"       "legacy super-server"  strict paranoid
 
 echo ""
 echo "--- Firewall ---"
+# Allow the port sshd ACTUALLY listens on, or enabling the firewall cuts off
+# the session running this script.
+SSH_PORTS=$(sshd -T 2>/dev/null | awk '$1=="port" {print $2}' | sort -un | tr '\n' ' ')
+SSH_PORTS=${SSH_PORTS:-22}
 if selected "HD-FW-001" baseline strict paranoid; then
   if command -v ufw >/dev/null 2>&1; then
-    if ufw status 2>/dev/null | head -1 | grep -qi active; then
+    # NOTE: match "Status: active" exactly - "inactive" also contains "active".
+    if ufw status 2>/dev/null | head -1 | grep -qiE '^status:[[:space:]]*active'; then
       say_ok "HD-FW-001" "ufw already active"
     elif [ "$DRY" = "1" ]; then
-      say_would "HD-FW-001" "ufw: default deny incoming, allow 22/tcp, enable"
+      say_would "HD-FW-001" "ufw: default deny incoming, allow ssh (${SSH_PORTS% }/tcp), enable"
     else
-      printf 'ufw: was inactive\n' >> "$JDIR/services.txt"
+      printf 'ufw: was inactive (revert: ufw disable)\n' >> "$JDIR/services.txt"
       ufw --force default deny incoming  >/dev/null 2>&1
       ufw --force default allow outgoing >/dev/null 2>&1
-      ufw allow 22/tcp                   >/dev/null 2>&1
+      for _p in $SSH_PORTS; do ufw allow "$_p/tcp" >/dev/null 2>&1; done
       if ufw --force enable >/dev/null 2>&1; then
-        say_set "HD-FW-001" "ufw enabled (deny incoming, SSH allowed)"
+        say_set "HD-FW-001" "ufw enabled (deny incoming, SSH ${SSH_PORTS% } allowed)"
       else
         say_fail "HD-FW-001" "ufw enable failed"
       fi
@@ -396,11 +481,17 @@ if selected "HD-FW-001" baseline strict paranoid; then
     elif [ "$DRY" = "1" ]; then
       say_would "HD-FW-001" "enable firewalld, allow ssh"
     else
-      printf 'firewalld: was stopped\n' >> "$JDIR/services.txt"
-      systemctl enable --now firewalld >/dev/null 2>&1
-      firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1
-      firewall-cmd --reload >/dev/null 2>&1
-      say_set "HD-FW-001" "firewalld enabled (ssh allowed)"
+      printf 'firewalld: was stopped (revert: systemctl disable --now firewalld)\n' >> "$JDIR/services.txt"
+      if systemctl enable --now firewalld >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1
+        for _p in $SSH_PORTS; do
+          [ "$_p" = "22" ] || firewall-cmd --permanent --add-port="$_p/tcp" >/dev/null 2>&1
+        done
+        firewall-cmd --reload >/dev/null 2>&1
+        say_set "HD-FW-001" "firewalld enabled (SSH ${SSH_PORTS% } allowed)"
+      else
+        say_fail "HD-FW-001" "firewalld enable failed"
+      fi
     fi
   else
     echo "  [skip]  HD-FW-001    no ufw/firewalld present; configure nftables manually"
@@ -427,7 +518,9 @@ if selected "HD-LG-001" baseline strict paranoid; then
 fi
 
 if selected "HD-LG-002" baseline strict paranoid; then
-  if [ -d /var/log/journal ]; then
+  if [ "$HAS_SYSTEMD" = "0" ]; then
+    say_ok "HD-LG-002" "no systemd journal on this host"
+  elif [ -d /var/log/journal ]; then
     say_ok "HD-LG-002" "journal already persistent"
   elif [ "$DRY" = "1" ]; then
     say_would "HD-LG-002" "make systemd journal persistent"
@@ -450,33 +543,30 @@ if selected "HD-LG-003" strict paranoid; then
     say_would "HD-LG-003" "install baseline audit rules"
   else
     backup_file "$ARULES"
-    cat > "$ARULES" <<'RULES'
-# Identity and authentication changes
--w /etc/passwd -p wa -k identity
--w /etc/shadow -p wa -k identity
--w /etc/group -p wa -k identity
--w /etc/gshadow -p wa -k identity
--w /etc/sudoers -p wa -k scope
--w /etc/sudoers.d/ -p wa -k scope
-# Login records
--w /var/log/lastlog -p wa -k logins
--w /var/run/faillock/ -p wa -k logins
-# Privilege escalation
--a always,exit -F arch=b64 -S execve -C uid!=euid -F euid=0 -k setuid_exec
-# Kernel module activity
--w /sbin/insmod -p x -k modules
--w /sbin/rmmod -p x -k modules
--w /sbin/modprobe -p x -k modules
--a always,exit -F arch=b64 -S init_module,delete_module -k modules
-# Time changes
--a always,exit -F arch=b64 -S adjtimex,settimeofday -k time-change
--w /etc/localtime -p wa -k time-change
-# Network config
--w /etc/hosts -p wa -k system-locale
--w /etc/sysconfig/network -p wa -k system-locale
-RULES
-    if command -v augenrules >/dev/null 2>&1; then augenrules --load >/dev/null 2>&1; fi
-    say_set "HD-LG-003" "baseline audit rules installed"
+    # File watches on a path that does not exist make auditctl reject the
+    # rule (and augenrules may stop loading the rest), so emit only the
+    # watches that apply to this distro.
+    {
+      echo "# Generated by harden.sh (HD-LG-003)"
+      for _w in "/etc/passwd:wa:identity" "/etc/shadow:wa:identity" \
+                "/etc/group:wa:identity" "/etc/gshadow:wa:identity" \
+                "/etc/sudoers:wa:scope" "/etc/sudoers.d/:wa:scope" \
+                "/var/log/lastlog:wa:logins" "/var/run/faillock/:wa:logins" \
+                "/sbin/insmod:x:modules" "/sbin/rmmod:x:modules" "/sbin/modprobe:x:modules" \
+                "/etc/localtime:wa:time-change" \
+                "/etc/hosts:wa:system-locale" "/etc/sysconfig/network:wa:system-locale"; do
+        _wp=${_w%%:*}; _rest=${_w#*:}
+        [ -e "$_wp" ] && printf -- '-w %s -p %s -k %s\n' "$_wp" "${_rest%%:*}" "${_rest#*:}"
+      done
+      echo "-a always,exit -F arch=b64 -S execve -C uid!=euid -F euid=0 -k setuid_exec"
+      echo "-a always,exit -F arch=b64 -S init_module,delete_module -k modules"
+      echo "-a always,exit -F arch=b64 -S adjtimex,settimeofday -k time-change"
+    } > "$ARULES"
+    if command -v augenrules >/dev/null 2>&1 && ! augenrules --load >/dev/null 2>&1; then
+      say_fail "HD-LG-003" "audit rules written but augenrules --load failed (check $ARULES)"
+    else
+      say_set "HD-LG-003" "baseline audit rules installed"
+    fi
   fi
 fi
 
@@ -491,6 +581,7 @@ fix_perm() {
   _cur=$(stat -c '%a' "$_path" 2>/dev/null)
   [ "$_cur" = "$_mode" ] && { say_ok "$_id" "$_path already $_mode"; return 0; }
   if [ "$DRY" = "1" ]; then say_would "$_id" "chmod $_mode $_path ($_cur now)"; return 0; fi
+  printf '%s\t%s\n' "$_cur" "$_path" >> "$JDIR/perms.txt"
   if chmod "$_mode" "$_path" 2>/dev/null; then say_set "$_id" "$_path -> $_mode ($_desc)"
   else say_fail "$_id" "chmod $_mode $_path"; fi
 }
@@ -511,6 +602,7 @@ if selected "HD-FS-003" baseline strict paranoid; then
   elif [ "$DRY" = "1" ]; then
     say_would "HD-FS-003" "chmod $want /etc/shadow (now $cur)"
   else
+    printf '%s\t%s\n' "$cur" /etc/shadow >> "$JDIR/perms.txt"
     chmod "$want" /etc/shadow 2>/dev/null && say_set "HD-FS-003" "/etc/shadow -> $want" \
       || say_fail "HD-FS-003" "chmod /etc/shadow"
   fi
@@ -525,6 +617,7 @@ if selected "HD-FS-005" strict paranoid; then
     say_would "HD-FS-005" "blacklist cramfs/freevxfs/jffs2/hfs/udf/dccp/sctp/rds/tipc"
   else
     backup_file "$MODF"
+    mkdir -p /etc/modprobe.d 2>/dev/null
     for m in cramfs freevxfs jffs2 hfs hfsplus udf dccp sctp rds tipc; do
       printf 'install %s /bin/true\n' "$m" >> "$MODF"
     done
@@ -573,6 +666,9 @@ fi
 echo ""
 echo "===== SUMMARY ====="
 if [ "$DRY" = "1" ]; then
+  echo "Would change : $WOULD"
+  echo "Already ok   : $NOOP"
+  [ "$FAILED" -gt 0 ] && echo "Blocked      : $FAILED (see [FAIL] lines)"
   echo "Dry run complete. Nothing changed."
   echo "Re-run without --dry-run to apply."
   exit 0

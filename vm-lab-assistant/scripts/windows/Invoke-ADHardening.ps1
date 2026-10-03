@@ -12,8 +12,11 @@
 
 .PARAMETER Profile
     Baseline - low-risk, widely applicable
-    Strict   - + NTLM restriction auditing, RC4 disablement, AD CS tightening
-    Paranoid - + aggressive delegation and legacy protocol removal
+    Strict   - + privileged-group cleanup, delegation removal, LSASS PPL,
+               RC4 disablement, LDAP channel binding enforced (Always)
+    Paranoid - + deny all NTLM in the domain
+    AD CS findings (ESC1-ESC4) are reported by Invoke-ADAudit.ps1 but never
+    auto-remediated: the fix depends on who legitimately enrols.
 
 .PARAMETER Only / -Skip
     Filter by control ID.
@@ -50,6 +53,7 @@ try { Import-Module ActiveDirectory -ErrorAction Stop }
 catch { Write-Error 'ActiveDirectory module required. Install RSAT-AD-PowerShell.'; exit 4 }
 
 $script:Journal = [System.Collections.Generic.List[object]]::new()
+$script:JournalFile = $null
 $script:Applied=0; $script:Failed=0; $script:Skipped=0
 
 function Test-Selected {
@@ -65,6 +69,25 @@ function Add-Journal {
     $script:Journal.Add([pscustomobject]@{
         Id=$Id;Type=$Type;Before=$Before;After=$After
         TimestampUtc=(Get-Date).ToUniversalTime().ToString('s')+'Z'})
+    Save-Journal
+}
+
+# Flush after every change so a crash or host timeout keeps a usable journal.
+function Save-Journal {
+    if (-not $script:JournalFile) {
+        New-Item -ItemType Directory -Force -Path $JournalPath | Out-Null
+        $script:JournalFile = Join-Path $JournalPath ("ad-rollback-{0}.json" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    }
+    ConvertTo-Json -InputObject @($script:Journal) -Depth 8 |
+        Set-Content -LiteralPath $script:JournalFile -Encoding UTF8
+}
+
+function Backup-AuditPolicy {
+    New-Item -ItemType Directory -Force -Path $JournalPath | Out-Null
+    $f = Join-Path $JournalPath ("ad-auditpol-{0}.csv" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    & auditpol /backup /file:"$f" | Out-Null
+    if (Test-Path -LiteralPath $f) { return @{ AuditPolBackup = $f } }
+    return @{}
 }
 
 function Invoke-ADControl {
@@ -125,10 +148,32 @@ function Set-ADHardeningReg {
 
 if ($RollbackFile) {
     if (-not (Test-Path $RollbackFile)) { Write-Error "Not found: $RollbackFile"; exit 2 }
-    $entries = Get-Content -LiteralPath $RollbackFile -Raw | ConvertFrom-Json
+    $entries = @(Get-Content -LiteralPath $RollbackFile -Raw | ConvertFrom-Json)
     for ($i=$entries.Count-1; $i -ge 0; $i--) {
         $e=$entries[$i]
-        if ($e.Type -ne 'Registry') { Write-Output "  [skip]  $($e.Id) : revert '$($e.Type)' manually"; continue }
+        if ($e.Type -ne 'Registry') {
+            $b = $e.Before
+            try {
+                if ($b -and $null -ne $b.Quota) {
+                    $d = Get-ADDomain
+                    Set-ADObject -Identity $d.DistinguishedName -Replace @{'ms-DS-MachineAccountQuota'=[int]$b.Quota} -ErrorAction Stop
+                    Write-Output "  [rev]   $($e.Id) : ms-DS-MachineAccountQuota=$($b.Quota)"
+                } elseif ($b -and $b.Service -and $b.StartMode) {
+                    $st = @{ Auto='Automatic'; Manual='Manual'; Disabled='Disabled' }["$($b.StartMode)"]
+                    if (-not $st) { throw "unmapped StartMode '$($b.StartMode)'" }
+                    Set-Service -Name $b.Service -StartupType $st -ErrorAction Stop
+                    if ("$($b.Status)" -eq 'Running') { Start-Service -Name $b.Service -ErrorAction Stop }
+                    Write-Output "  [rev]   $($e.Id) : $($b.Service) -> $st"
+                } elseif ($b -and $b.AuditPolBackup -and (Test-Path -LiteralPath $b.AuditPolBackup)) {
+                    & auditpol /restore /file:"$($b.AuditPolBackup)" | Out-Null
+                    Write-Output "  [rev]   $($e.Id) : audit policy restored from $($b.AuditPolBackup)"
+                } else {
+                    Write-Output "  [skip]  $($e.Id) : revert '$($e.Type)' manually. Prior state:"
+                    Write-Output ("          " + (ConvertTo-Json -InputObject $b -Depth 4 -Compress))
+                }
+            } catch { Write-Output "  [FAIL]  $($e.Id) : $($_.Exception.Message)" }
+            continue
+        }
         try {
             if ($null -eq $e.Before.Value) {
                 Remove-ItemProperty -Path $e.Before.Path -Name $e.Before.Name -Force -ErrorAction SilentlyContinue
@@ -303,10 +348,19 @@ if ($IsDC) {
         -Name 'LDAPServerIntegrity' -Value 2 `
         -Description 'Require LDAP signing (blocks LDAP relay)'
 
+    # Channel binding: 1 (when supported) is the safe first step; 2 (always)
+    # rejects LDAPS clients that cannot send CBT, so it is Strict+ only.
     Set-ADHardeningReg -Id 'ADH-021' `
         -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters' `
+        -Name 'LdapEnforceChannelBinding' -Value 1 `
+        -Description 'LDAP channel binding when supported (blocks LDAPS relay for capable clients)' `
+        -Profiles @('Baseline')
+
+    Set-ADHardeningReg -Id 'ADH-028' `
+        -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters' `
         -Name 'LdapEnforceChannelBinding' -Value 2 `
-        -Description 'Enforce LDAP channel binding (blocks LDAPS relay)'
+        -Description 'Enforce LDAP channel binding always (blocks LDAPS relay)' `
+        -Profiles @('Strict','Paranoid')
 
     Invoke-ADControl -Id 'ADH-022' `
         -Description 'Disable Print Spooler on DC (blocks PrinterBug coercion)' `
@@ -317,7 +371,7 @@ if ($IsDC) {
         } `
         -CaptureState {
             $s=Get-Service Spooler -ErrorAction SilentlyContinue
-            @{Status=if($s){"$($s.Status)"}; StartMode=(Get-CimInstance Win32_Service -Filter "Name='Spooler'" -ErrorAction SilentlyContinue).StartMode}
+            @{Service='Spooler'; Status=if($s){"$($s.Status)"}; StartMode=(Get-CimInstance Win32_Service -Filter "Name='Spooler'" -ErrorAction SilentlyContinue).StartMode}
         } `
         -Apply {
             Stop-Service Spooler -Force -ErrorAction SilentlyContinue
@@ -350,7 +404,7 @@ if ($IsDC) {
     Set-ADHardeningReg -Id 'ADH-027' `
         -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters' `
         -Name 'SupportedEncryptionTypes' -Value 24 `
-        -Description 'Kerberos AES128+AES256 only (disable RC4/DES)' `
+        -Description 'Kerberos AES128+AES256 only (disable RC4/DES; rotate krbtgt and old service passwords first)' `
         -Profiles @('Strict','Paranoid')
 }
 
@@ -362,6 +416,7 @@ Write-Output '--- Audit policy (AD-relevant) ---'
 Invoke-ADControl -Id 'ADH-030' `
     -Description 'Enable AD-focused audit subcategories' `
     -Test { $false } `
+    -CaptureState { Backup-AuditPolicy } `
     -Apply {
         $subs=@(
             @{N='Directory Service Access';     S='enable'; F='enable'}
@@ -400,12 +455,12 @@ Write-Output ("Failed  : {0}" -f $script:Failed)
 Write-Output ("Skipped : {0}" -f $script:Skipped)
 
 if ($script:Journal.Count -gt 0) {
-    New-Item -ItemType Directory -Force -Path $JournalPath | Out-Null
-    $jf = Join-Path $JournalPath ("ad-rollback-{0}.json" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
-    $script:Journal | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $jf -Encoding UTF8
+    Save-Journal
+    $jf = $script:JournalFile
     Write-Output ''
     Write-Output "Rollback journal: $jf"
-    Write-Output "NOTE: registry entries auto-revert; AD object changes are listed but must be undone manually."
+    Write-Output "NOTE: registry, Spooler, MachineAccountQuota and audit policy auto-revert;"
+    Write-Output "      other AD object changes are printed with their prior state for manual undo."
 }
 
 Write-Output ''

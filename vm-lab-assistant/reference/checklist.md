@@ -133,8 +133,8 @@ Then reboot for sysctl and module changes, and re-audit.
 
 | # | Check |
 |---|---|
-| 5.1 | Score improved vs the Phase 1 baseline |
-| 5.2 | No new `Fail` results |
+| 5.1 | Score improved vs the Phase 1 baseline: `[H] ./scripts/vmctl.sh compare baseline.json after.json` |
+| 5.2 | No regressions (`compare` exits 0) and no new `Fail` results |
 | 5.3 | Guest still reachable (`status` / `ssh 'id'`) |
 | 5.4 | Required applications still work |
 | 5.5 | Remove the elevation task: `[G] .\Enable-AgentElevation.ps1 -Remove` |
